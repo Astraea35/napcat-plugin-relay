@@ -1,0 +1,12 @@
+# Runtime and user configuration (contains user QQ, tokens, etc.)
+config.json
+message_map.json
+data/
+*.log
+
+# Dependencies and system files
+node_modules/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

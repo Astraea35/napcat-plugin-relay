@@ -1,0 +1,19 @@
+{
+  "name": "napcat-plugin-relay",
+  "plugin": "消息中转传话",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "NapCat 消息双向中转与引用回复插件，支持会话框消息免打扰（DND）智能过滤",
+  "author": "Astraea35",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Astraea35/napcat-plugin-relay.git"
+  },
+  "dependencies": {},
+  "napcat": {
+    "tags": ["工具", "客服", "中转", "免打扰"],
+    "minVersion": "4.0.0"
+  }
+}
