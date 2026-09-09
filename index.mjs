@@ -1,5 +1,10 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const defaultCatPath = path.join(__dirname, 'assets', 'monthly_salary_cat.gif');
 
 let logger = null;
 let pluginConfigPath = '';
@@ -18,6 +23,12 @@ let currentConfig = {
   forward_friend_request: true,    // 转发好友申请给管理员
   auto_approve_friend: false,      // 是否自动同意好友申请
   auto_approve_keyword: "",        // 附言包含关键字时自动同意（留空不启用）
+  // 定时群发月薪喵表情包配置
+  enable_schedule: true,           // 是否开启定时群发
+  schedule_groups: "",             // 目标群聊列表（支持逗号/空格/换行分隔，如：123456, 7891011）
+  schedule_times: "09:00, 12:00, 18:00", // 每天定时发送时间点（24小时制 HH:mm，支持逗号分隔）
+  schedule_text: "",               // 发送表情包时的附加文本
+  schedule_custom_image: "",       // 自定义表情图片路径或 URL（留空使用内置月薪喵）
 };
 
 // 内存中的消息映射: sent_msg_id -> target info
@@ -414,6 +425,153 @@ async function isChatDND(ctx, event) {
   return false;
 }
 
+// ========================================================
+// 定时群发月薪喵表情包核心调度模块
+// ========================================================
+
+let catImageBase64Cache = null;
+let scheduleTimer = null;
+let lastTriggerMinute = '';
+
+/**
+ * 获取内置月薪喵表情包的 Base64 编码
+ */
+function getCatImageBase64() {
+  if (catImageBase64Cache) return catImageBase64Cache;
+  try {
+    if (fs.existsSync(defaultCatPath)) {
+      const buf = fs.readFileSync(defaultCatPath);
+      catImageBase64Cache = `base64://${buf.toString('base64')}`;
+      logger?.debug?.(`[Relay Schedule] 已成功加载内置月薪喵表情包 Base64 (大小: ${buf.length} 字节)`);
+      return catImageBase64Cache;
+    } else {
+      logger?.warn('[Relay Schedule] 内置表情包文件不存在:', defaultCatPath);
+    }
+  } catch (err) {
+    logger?.error('[Relay Schedule] 读取内置月薪喵表情包失败:', err);
+  }
+  return null;
+}
+
+/**
+ * 批量发送月薪喵表情包到配置的目标群聊
+ */
+async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targetGroupOverride = null) {
+  let groups = [];
+  if (targetGroupOverride) {
+    groups = [String(targetGroupOverride).trim()];
+  } else {
+    groups = (currentConfig.schedule_groups || '')
+      .split(/[,，\s\n]+/)
+      .map(g => g.trim())
+      .filter(g => /^\d+$/.test(g));
+  }
+
+  if (groups.length === 0) {
+    logger?.warn(`[Relay Schedule] ${sourceLabel}: 未配置任何有效的目标群号，跳过发送`);
+    return { success: false, message: '未配置任何有效的目标群号，请在插件设置中配置群号或使用指令 #设置群聊 <群号>' };
+  }
+
+  let imageFile = currentConfig.schedule_custom_image?.trim();
+  if (!imageFile) {
+    imageFile = getCatImageBase64();
+  }
+
+  if (!imageFile) {
+    logger?.error(`[Relay Schedule] ${sourceLabel}: 无法获取月薪喵表情包资源`);
+    return { success: false, message: '无法获取表情包资源文件' };
+  }
+
+  const msgElements = [];
+  if (currentConfig.schedule_text && currentConfig.schedule_text.trim()) {
+    msgElements.push({
+      type: 'text',
+      data: { text: currentConfig.schedule_text.trim() + '\n' }
+    });
+  }
+  msgElements.push({
+    type: 'image',
+    data: { file: imageFile }
+  });
+
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const gid of groups) {
+    try {
+      await ctx.actions.call('send_group_msg', {
+        group_id: Number(gid),
+        message: msgElements
+      }, ctx.adapterName, ctx.pluginManager?.config);
+      successCount++;
+      logger?.info(`[Relay Schedule] ✅ ${sourceLabel}: 已成功发送月薪喵表情包至群聊: ${gid}`);
+    } catch (err) {
+      failCount++;
+      logger?.error(`[Relay Schedule] ❌ ${sourceLabel}: 发送表情包至群聊 ${gid} 失败:`, err);
+    }
+  }
+
+  return {
+    success: successCount > 0,
+    successCount,
+    failCount,
+    total: groups.length,
+    message: `成功发送至 ${successCount}/${groups.length} 个群聊`
+  };
+}
+
+/**
+ * 启动定时调度轮询器
+ */
+function startScheduler(ctx) {
+  if (scheduleTimer) {
+    clearInterval(scheduleTimer);
+    scheduleTimer = null;
+  }
+
+  scheduleTimer = setInterval(async () => {
+    try {
+      if (!currentConfig.enable_schedule) return;
+
+      const now = new Date();
+      const hours = String(now.getHours()).padStart(2, '0');
+      const minutes = String(now.getMinutes()).padStart(2, '0');
+      const currentTimeStr = `${hours}:${minutes}`;
+      const currentDateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const triggerKey = `${currentDateStr} ${currentTimeStr}`;
+
+      if (lastTriggerMinute === triggerKey) {
+        return; // 该分钟已执行
+      }
+
+      const configuredTimes = (currentConfig.schedule_times || '')
+        .split(/[,，\s]+/)
+        .map(t => t.trim())
+        .filter(Boolean)
+        .map(t => {
+          const parts = t.split(':');
+          if (parts.length === 2) {
+            return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+          }
+          return t;
+        });
+
+      if (!configuredTimes.includes(currentTimeStr)) {
+        return;
+      }
+
+      lastTriggerMinute = triggerKey;
+      logger?.info(`[Relay Schedule] ⏰ 到达定时发送时间点: ${currentTimeStr}，开始执行群聊广播...`);
+
+      await sendCatToConfiguredGroups(ctx, `定时任务(${currentTimeStr})`);
+    } catch (err) {
+      logger?.error('[Relay Schedule] 定时任务轮询执行异常:', err);
+    }
+  }, 25000);
+
+  logger?.info('[Relay Schedule] 定时调度引擎已启动 (轮询周期: 25秒)');
+}
+
 /**
  * 插件初始化
  */
@@ -441,7 +599,10 @@ export const plugin_init = async (ctx) => {
   // 2. 加载历史消息映射
   loadMessageMap();
 
-  // 3. 构建 WebUI 配置界面
+  // 3. 启动定时任务调度器
+  startScheduler(ctx);
+
+  // 4. 构建 WebUI 配置界面
   if (ctx.NapCatConfig) {
     plugin_config_ui = ctx.NapCatConfig.combine(
       ctx.NapCatConfig.html('<div style="padding: 12px; background: rgba(0,0,0,0.04); border-radius: 8px; margin-bottom: 10px;">' +
@@ -458,11 +619,23 @@ export const plugin_init = async (ctx) => {
       ctx.NapCatConfig.boolean("ignore_dnd", "自动过滤QQ客户端免打扰会话", true, "自动识别并跳过QQ客户端中设置了【消息免打扰】（接收不提醒）或【屏蔽】的群聊与好友会话"),
       ctx.NapCatConfig.text("dnd_list_str", "手动免打扰名单 (QQ/群号)", "", "额外的免打扰名单，多个QQ号或群号可用逗号、空格或换行分隔，设置后这些会话的消息不会被转发"),
       ctx.NapCatConfig.boolean("show_sender_info", "显示发送者信息前缀", true, "转发消息时附加 [来自私聊: 昵称(QQ)] 标识"),
-      ctx.NapCatConfig.boolean("send_confirmation", "发送回复成功回执", true, "管理员引用回复成功转回后，是否向管理员发送成功提示")
+      ctx.NapCatConfig.boolean("send_confirmation", "发送回复成功回执", true, "管理员引用回复成功转回后，是否向管理员发送成功提示"),
+      // 定时发送月薪喵表情包配置
+      ctx.NapCatConfig.html(
+        '<div style="margin: 15px 0 10px; padding: 12px; background: rgba(64, 158, 255, 0.08); border-left: 4px solid #409eff; border-radius: 4px;">' +
+        '  <h4 style="margin: 0 0 5px; color: #409eff;">⏰ 定时发送月薪喵表情包</h4>' +
+        '  <span style="font-size: 13px; color: #666;">支持在每天固定时间自动向指定的QQ群批量发送最新月薪喵打工表情包。群号与发送时间均可自定义。</span>' +
+        '</div>'
+      ),
+      ctx.NapCatConfig.boolean("enable_schedule", "开启定时发送", true, "是否启用每日固定时间群发月薪喵表情包"),
+      ctx.NapCatConfig.text("schedule_groups", "定时发送目标群号", "", "需要定时发送表情包的群号列表，支持多个群号，用逗号、空格或换行分隔（如：123456, 7891011）"),
+      ctx.NapCatConfig.text("schedule_times", "每日定时发送时间点", "09:00, 12:00, 18:00", "24小时制 HH:mm，多个时间用逗号分隔，例如：09:00, 12:00, 18:00"),
+      ctx.NapCatConfig.text("schedule_text", "附带文本说明 (可选)", "", "发送表情包时随图附带的文字，留空则纯发表情包"),
+      ctx.NapCatConfig.text("schedule_custom_image", "自定义表情图片 (可选)", "", "留空则默认使用内置的最新月薪喵动态表情；可填写本地绝对路径、网络图片URL或 base64://")
     );
   }
 
-  logger.info(`[Relay] 插件初始化完成！目标管理员: ${currentConfig.target_qq || '(未配置)'}，免打扰过滤: ${currentConfig.ignore_dnd ? '开' : '关'}，好友申请转发: ${currentConfig.forward_friend_request ? '开' : '关'}`);
+  logger.info(`[Relay] 插件初始化完成！目标管理员: ${currentConfig.target_qq || '(未配置)'}，免打扰过滤: ${currentConfig.ignore_dnd ? '开' : '关'}，好友申请转发: ${currentConfig.forward_friend_request ? '开' : '关'}，定时月薪喵: ${currentConfig.enable_schedule ? '开' : '关'}`);
 };
 
 /**
@@ -512,11 +685,18 @@ export const plugin_onmessage = async (ctx, event) => {
         `🔕 QQ免打扰过滤: ${currentConfig.ignore_dnd ? '✅ 自动过滤' : '❌ 未启用'}\n` +
         `📋 手动免打扰名单: ${dndPreview}\n` +
         `🔔 发送回执: ${currentConfig.send_confirmation ? '✅ 开启' : '❌ 关闭'}\n` +
+        `⏰ 定时月薪喵: ${currentConfig.enable_schedule ? '✅ 开启' : '❌ 关闭'}\n` +
+        `🕒 每日触发时间: ${currentConfig.schedule_times || '未设置'}\n` +
+        `📢 定时目标群聊: ${currentConfig.schedule_groups || '未配置'}\n` +
         `📊 活跃引用映射条数: ${messageMap.size} 条\n` +
         `━━━━━━━━━━━━━━━\n` +
         `💡 提示指令:\n` +
         `• 【引用回复】消息：自动原路回复该好友/群聊\n` +
         `• 【引用回复】好友申请：回复「同意」或「拒绝」即可处理申请\n` +
+        `• 发送 #测试月薪喵 [群号] / #月薪喵\n` +
+        `• 发送 #设置群聊 <群号1,群号2...>\n` +
+        `• 发送 #设置时间 <09:00,12:00,18:00>\n` +
+        `• 发送 #开启月薪喵 / #关闭月薪喵\n` +
         `• 发送 #同意 <QQ号> [备注名] / #拒绝 <QQ号>\n` +
         `• 发送 #免打扰 查看免打扰设置与指令`;
 
@@ -636,7 +816,99 @@ export const plugin_onmessage = async (ctx, event) => {
       return;
     }
 
-    // 7. 检测引用回复
+    // 7. 定时月薪喵表情包测试与触发指令
+    if (rawText.startsWith('#测试月薪喵') || rawText.startsWith('#发送月薪喵') || rawText === '#月薪喵') {
+      const parts = rawText.split(/\s+/);
+      const targetGroup = parts[1] ? parts[1].trim() : null;
+
+      try {
+        if (targetGroup && /^\d+$/.test(targetGroup)) {
+          const res = await sendCatToConfiguredGroups(ctx, '管理员手动指令', targetGroup);
+          await ctx.actions.call('send_private_msg', {
+            user_id: targetQq,
+            message: res.success ? `✅ 已成功向群聊 [${targetGroup}] 发送月薪喵表情包！` : `❌ 发送失败: ${res.message}`
+          }, ctx.adapterName, ctx.pluginManager.config);
+        } else {
+          const configuredGroups = (currentConfig.schedule_groups || '')
+            .split(/[,，\s\n]+/)
+            .map(g => g.trim())
+            .filter(g => /^\d+$/.test(g));
+
+          if (configuredGroups.length > 0) {
+            const res = await sendCatToConfiguredGroups(ctx, '管理员手动指令');
+            await ctx.actions.call('send_private_msg', {
+              user_id: targetQq,
+              message: `✅ 已执行向所有配置群聊发送月薪喵表情包，结果: ${res.message}`
+            }, ctx.adapterName, ctx.pluginManager.config);
+          } else {
+            const imgFile = currentConfig.schedule_custom_image?.trim() || getCatImageBase64();
+            await ctx.actions.call('send_private_msg', {
+              user_id: targetQq,
+              message: [
+                { type: 'text', data: { text: '🐱 【月薪喵表情包预览】\n（当前尚未配置定时发送目标群聊，可在 WebUI 或私聊发送 #设置群聊 <群号> 进行配置）：\n' } },
+                { type: 'image', data: { file: imgFile } }
+              ]
+            }, ctx.adapterName, ctx.pluginManager.config);
+          }
+        }
+      } catch (err) {
+        logger?.error('[Relay] 执行月薪喵测试指令异常:', err);
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `❌ 测试发送月薪喵失败: ${err.message || err}`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      }
+      return;
+    }
+
+    // 8. 快捷指令：设置定时群聊 (#设置群聊 <群号1,群号2...>)
+    const setGroupsMatch = rawText.match(/^#(?:设置群聊|配置群聊|定时群聊)\s+(.+)$/);
+    if (setGroupsMatch) {
+      const input = setGroupsMatch[1].trim();
+      currentConfig.schedule_groups = input;
+      saveConfigToFile();
+      const groups = input.split(/[,，\s\n]+/).map(g => g.trim()).filter(g => /^\d+$/.test(g));
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已成功更新定时发送群聊列表 (共 ${groups.length} 个有效群)：\n${groups.join(', ')}\n\n💡 发送 #测试月薪喵 可立即进行测试。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 9. 快捷指令：设置定时时间 (#设置时间 <09:00,12:00,18:00>)
+    const setTimesMatch = rawText.match(/^#(?:设置时间|配置时间|定时时间)\s+(.+)$/);
+    if (setTimesMatch) {
+      const input = setTimesMatch[1].trim();
+      currentConfig.schedule_times = input;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已成功更新每日定时发送时间点：\n${input}\n\n系统将在每天上述设定时间向目标群聊自动发送月薪喵表情包。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 10. 快捷指令：开启/关闭月薪喵定时
+    if (rawText === '#开启月薪喵' || rawText === '#启用月薪喵') {
+      currentConfig.enable_schedule = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启定时群发月薪喵表情包。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭月薪喵' || rawText === '#停用月薪喵' || rawText === '#禁用月薪喵') {
+      currentConfig.enable_schedule = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已暂停定时群发月薪喵表情包。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 11. 检测引用回复
     let repliedMsgId = null;
 
     if (Array.isArray(event.message)) {
@@ -910,4 +1182,19 @@ export const plugin_set_config = async (ctx, config) => {
   }
 
   saveConfigToFile(ctx?.configPath);
+};
+
+/**
+ * 插件卸载/清理资源
+ */
+export const plugin_cleanup = async () => {
+  if (scheduleTimer) {
+    clearInterval(scheduleTimer);
+    scheduleTimer = null;
+    logger?.info('[Relay Schedule] 定时调度器已停止');
+  }
+  if (saveTimer) {
+    clearInterval(saveTimer);
+    saveTimer = null;
+  }
 };
