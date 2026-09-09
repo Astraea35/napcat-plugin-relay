@@ -17,6 +17,9 @@ let currentConfig = {
   forward_group_at_only: true,
   send_confirmation: true,
   show_sender_info: true,
+  show_original_nickname: false,   // 备注名后是否显示用户实际QQ昵称（默认关，仅显示备注名）
+  enable_quote_reply: true,         // 回复对方时是否使用引用回复（引用对方的原消息）
+  forward_file: true,              // 是否自动转发接收到的文件
   ignore_dnd: true,                // 自动检测并跳过QQ客户端设置了“消息免打扰”或“屏蔽”的会话
   dnd_list: [],                    // 手动免打扰/黑名单列表 (QQ号或群号字符串数组)
   dnd_list_str: "",                // 供 WebUI 展示的免打扰名单文本
@@ -47,6 +50,96 @@ const pendingFriendRequests = new Map();
 let groupMaskCache = null;
 let groupMaskCacheTime = 0;
 const GROUP_MASK_CACHE_TTL = 15000; // 15秒缓存
+
+// 好友备注与昵称缓存: uin -> { nickname, remark, lastUpdated }
+const friendCache = new Map();
+let lastFriendRefresh = 0;
+const FRIEND_CACHE_TTL = 300000; // 5分钟自动刷新缓存
+
+/**
+ * 刷新好友列表缓存（获取所有好友的最新备注与原始昵称）
+ */
+async function refreshFriendCache(ctx, force = false) {
+  const now = Date.now();
+  if (!force && friendCache.size > 0 && now - lastFriendRefresh < FRIEND_CACHE_TTL) {
+    return;
+  }
+  try {
+    const res = await ctx.actions.call('get_friend_list', {}, ctx.adapterName, ctx.pluginManager?.config);
+    if (Array.isArray(res)) {
+      for (const item of res) {
+        if (item && item.user_id) {
+          friendCache.set(String(item.user_id), {
+            nickname: (item.nickname || '').trim(),
+            remark: (item.remark || '').trim(),
+            lastUpdated: now
+          });
+        }
+      }
+      lastFriendRefresh = now;
+      logger?.debug?.(`[Relay] 成功刷新好友信息缓存，共 ${friendCache.size} 位好友`);
+    }
+  } catch (e) {
+    logger?.debug?.('[Relay] 获取好友列表异常:', e);
+  }
+}
+
+/**
+ * 获取并格式化用户的显示名称（严格保证备注名最高优先级）
+ * @param {object} ctx NapCat 上下文
+ * @param {string|number} userId 用户QQ号
+ * @param {string} fallbackNickname 备用昵称
+ * @returns {Promise<string>}
+ */
+async function getUserDisplayName(ctx, userId, fallbackNickname = '') {
+  const uin = String(userId || '').trim();
+  if (!uin) return '';
+
+  let cached = friendCache.get(uin);
+  if (!cached) {
+    await refreshFriendCache(ctx);
+    cached = friendCache.get(uin);
+  }
+
+  let remark = (cached?.remark || '').trim();
+  let nickname = (cached?.nickname || fallbackNickname || '').trim();
+
+  // 如果缓存无记录且无昵称，尝试获取陌生人信息
+  if (!remark && !nickname) {
+    try {
+      const info = await ctx.actions.call('get_stranger_info', { user_id: Number(uin) }, ctx.adapterName, ctx.pluginManager?.config);
+      if (info && info.nickname) {
+        nickname = String(info.nickname).trim();
+      }
+    } catch (e) {}
+  }
+
+  if (!nickname) {
+    nickname = uin;
+  }
+
+  // 核心规则：备注名优先级最高
+  if (remark) {
+    if (currentConfig.show_original_nickname && nickname && nickname !== remark) {
+      return `${remark} (${nickname})`;
+    }
+    return remark;
+  }
+
+  return nickname;
+}
+
+/**
+ * 格式化文件大小可读字符串
+ */
+function formatFileSize(bytes) {
+  const b = Number(bytes);
+  if (isNaN(b) || b <= 0) return '未知大小';
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 export let plugin_config_ui = [];
 
@@ -191,13 +284,21 @@ async function executeFriendRequestAction(ctx, reqInfo, approve, remark, targetQ
     pendingFriendRequests.delete(String(reqInfo.user_id));
     pendingFriendRequests.delete(String(reqInfo.flag));
 
+    if (approve && remark) {
+      friendCache.set(String(reqInfo.user_id), {
+        nickname: reqInfo.nickname || '',
+        remark: remark,
+        lastUpdated: Date.now()
+      });
+    }
+
     const actionText = approve ? '✅ 已成功同意好友申请' : '❌ 已拒绝好友申请';
     const remarkText = (approve && remark) ? `\n🏷️ 备注名: ${remark}` : '';
-    const userDisplay = reqInfo.nickname ? `${reqInfo.nickname} (${reqInfo.user_id})` : reqInfo.user_id;
+    const userDisplay = await getUserDisplayName(ctx, reqInfo.user_id, reqInfo.nickname);
 
     await ctx.actions.call('send_private_msg', {
       user_id: targetQq,
-      message: `${actionText}！\n📌 好友: ${userDisplay}${remarkText}`
+      message: `${actionText}！\n📌 好友: ${userDisplay} (${reqInfo.user_id})${remarkText}`
     }, ctx.adapterName, ctx.pluginManager.config);
 
     logger?.info(`[Relay] 管理员已${approve ? '同意' : '拒绝'} ${reqInfo.user_id} 的好友申请`);
@@ -223,22 +324,12 @@ async function handleFriendRequestEvent(ctx, event) {
   const flag = String(event.flag || '');
   const comment = event.comment || '';
 
-  // 1. 获取申请人昵称 (如有)
-  let nickname = applicantId;
-  try {
-    const info = await ctx.actions.call('get_stranger_info', {
-      user_id: Number(applicantId)
-    }, ctx.adapterName, ctx.pluginManager.config);
-    if (info && info.nickname) {
-      nickname = info.nickname;
-    }
-  } catch (e) {
-    logger?.debug('[Relay] 获取陌生人信息异常:', e);
-  }
+  // 1. 获取申请人备注名或昵称 (优先备注名)
+  const displayName = await getUserDisplayName(ctx, applicantId, applicantId);
 
   const reqInfo = {
     user_id: applicantId,
-    nickname,
+    nickname: displayName,
     flag,
     comment,
     time: event.time ? Number(event.time) * 1000 : Date.now()
@@ -257,7 +348,7 @@ async function handleFriendRequestEvent(ctx, event) {
 
       await ctx.actions.call('send_private_msg', {
         user_id: targetQq,
-        message: `🤖 【自动同意好友申请】\n━━━━━━━━━━━━━━━\n📌 申请人: ${nickname} (${applicantId})\n📝 验证消息: ${comment || '(无附言)'}\n💡 匹配规则: ${currentConfig.auto_approve_friend ? '全局自动同意' : `关键词「${kw}」`}`
+        message: `🤖 【自动同意好友申请】\n━━━━━━━━━━━━━━━\n📌 申请人: ${displayName} (${applicantId})\n📝 验证消息: ${comment || '(无附言)'}\n💡 匹配规则: ${currentConfig.auto_approve_friend ? '全局自动同意' : `关键词「${kw}」`}`
       }, ctx.adapterName, ctx.pluginManager.config);
       return;
     } catch (err) {
@@ -270,7 +361,7 @@ async function handleFriendRequestEvent(ctx, event) {
   const notifyText =
     `👤 【收到新的好友申请】\n` +
     `━━━━━━━━━━━━━━━\n` +
-    `📌 申请人: ${nickname} (${applicantId})\n` +
+    `📌 申请人: ${displayName} (${applicantId})\n` +
     `📝 验证消息: ${comment || '(无附言)'}\n` +
     `⏱️ 申请时间: ${timeStr}\n` +
     `━━━━━━━━━━━━━━━\n` +
@@ -602,7 +693,10 @@ export const plugin_init = async (ctx) => {
   // 3. 启动定时任务调度器
   startScheduler(ctx);
 
-  // 4. 构建 WebUI 配置界面
+  // 4. 预加载好友列表与备注缓存
+  refreshFriendCache(ctx).catch(err => logger?.debug?.('[Relay] 预加载好友缓存失败:', err));
+
+  // 5. 构建 WebUI 配置界面
   if (ctx.NapCatConfig) {
     plugin_config_ui = ctx.NapCatConfig.combine(
       ctx.NapCatConfig.html('<div style="padding: 12px; background: rgba(0,0,0,0.04); border-radius: 8px; margin-bottom: 10px;">' +
@@ -613,12 +707,15 @@ export const plugin_init = async (ctx) => {
       ctx.NapCatConfig.boolean("forward_private", "转发私聊消息", true, "开启后，所有好友和陌生人发给机器人的私聊消息均会转发给管理员"),
       ctx.NapCatConfig.boolean("forward_group", "转发群聊消息", false, "是否转发群聊消息给管理员（建议谨慎开启，避免群消息过多）"),
       ctx.NapCatConfig.boolean("forward_group_at_only", "群聊仅转发@我的消息", true, "当开启群聊转发时，仅转发艾特机器人的群消息"),
+      ctx.NapCatConfig.boolean("forward_file", "转发文件消息", true, "收到私聊/群聊文件时，自动向管理员转发 QQ 原生文件卡片并推送文件详情与下载直链"),
+      ctx.NapCatConfig.boolean("enable_quote_reply", "回复对方时使用引用回复", true, "管理员引用回复中转消息时，机器人向原好友发送消息是否【引用回复】对方最初发送的那条消息"),
+      ctx.NapCatConfig.boolean("show_original_nickname", "备注名后显示原QQ昵称", false, "开启后，若好友设置了备注名，则显示为「备注名 (原昵称)」；关闭则仅显示「备注名」"),
       ctx.NapCatConfig.boolean("forward_friend_request", "转发好友申请通知", true, "收到好友申请时推送到管理员私聊，支持管理员引用回复或发指令一键同意/拒绝"),
       ctx.NapCatConfig.boolean("auto_approve_friend", "自动同意所有好友申请", false, "无需管理员审核，收到的所有好友申请直接自动通过"),
       ctx.NapCatConfig.text("auto_approve_keyword", "关键词自动同意好友", "", "当好友申请的验证消息包含指定关键词时自动通过（留空不启用）"),
       ctx.NapCatConfig.boolean("ignore_dnd", "自动过滤QQ客户端免打扰会话", true, "自动识别并跳过QQ客户端中设置了【消息免打扰】（接收不提醒）或【屏蔽】的群聊与好友会话"),
       ctx.NapCatConfig.text("dnd_list_str", "手动免打扰名单 (QQ/群号)", "", "额外的免打扰名单，多个QQ号或群号可用逗号、空格或换行分隔，设置后这些会话的消息不会被转发"),
-      ctx.NapCatConfig.boolean("show_sender_info", "显示发送者信息前缀", true, "转发消息时附加 [来自私聊: 昵称(QQ)] 标识"),
+      ctx.NapCatConfig.boolean("show_sender_info", "显示发送者信息前缀", true, "转发消息时附加 [来自私聊: 备注名(QQ)] 标识"),
       ctx.NapCatConfig.boolean("send_confirmation", "发送回复成功回执", true, "管理员引用回复成功转回后，是否向管理员发送成功提示"),
       // 定时发送月薪喵表情包配置
       ctx.NapCatConfig.html(
@@ -680,6 +777,9 @@ export const plugin_onmessage = async (ctx, event) => {
         `📥 私聊转发: ${currentConfig.forward_private ? '✅ 开启' : '❌ 关闭'}\n` +
         `👥 群聊转发: ${currentConfig.forward_group ? '✅ 开启' : '❌ 关闭'}\n` +
         `🎯 群聊仅@: ${currentConfig.forward_group_at_only ? '✅ 开启' : '❌ 关闭'}\n` +
+        `📁 文件转发: ${currentConfig.forward_file ? '✅ 开启' : '❌ 关闭'}\n` +
+        `🏷️ 备注名优先: ✅ 开启 (原昵称追加: ${currentConfig.show_original_nickname ? '开启' : '关闭'})\n` +
+        `💬 引用回复原消息: ${currentConfig.enable_quote_reply ? '✅ 开启' : '❌ 关闭'}\n` +
         `🤝 好友申请推送: ${currentConfig.forward_friend_request ? '✅ 开启' : '❌ 关闭'}\n` +
         `🤖 好友自动通过: ${currentConfig.auto_approve_friend ? '✅ 全自动' : (currentConfig.auto_approve_keyword ? `🔑 关键词「${currentConfig.auto_approve_keyword}」` : '❌ 手动审核')}\n` +
         `🔕 QQ免打扰过滤: ${currentConfig.ignore_dnd ? '✅ 自动过滤' : '❌ 未启用'}\n` +
@@ -688,11 +788,14 @@ export const plugin_onmessage = async (ctx, event) => {
         `⏰ 定时月薪喵: ${currentConfig.enable_schedule ? '✅ 开启' : '❌ 关闭'}\n` +
         `🕒 每日触发时间: ${currentConfig.schedule_times || '未设置'}\n` +
         `📢 定时目标群聊: ${currentConfig.schedule_groups || '未配置'}\n` +
-        `📊 活跃引用映射条数: ${messageMap.size} 条\n` +
+        `📊 活跃引用映射条数: ${messageMap.size} 条 | 好友缓存: ${friendCache.size} 位\n` +
         `━━━━━━━━━━━━━━━\n` +
-        `💡 提示指令:\n` +
+        `💡 快捷管理指令:\n` +
         `• 【引用回复】消息：自动原路回复该好友/群聊\n` +
-        `• 【引用回复】好友申请：回复「同意」或「拒绝」即可处理申请\n` +
+        `• 【引用回复】好友申请：回复「同意」或「拒绝」处理申请\n` +
+        `• 发送 #刷新好友 (立即同步最新QQ好友备注)\n` +
+        `• 发送 #开启原名 / #关闭原名 (切换是否显示原昵称)\n` +
+        `• 发送 #开启引用回复 / #关闭引用回复\n` +
         `• 发送 #测试月薪喵 [群号] / #月薪喵\n` +
         `• 发送 #设置群聊 <群号1,群号2...>\n` +
         `• 发送 #设置时间 <09:00,12:00,18:00>\n` +
@@ -908,7 +1011,77 @@ export const plugin_onmessage = async (ctx, event) => {
       return;
     }
 
-    // 11. 检测引用回复
+    // 11. 快捷指令：开启/关闭引用回复
+    if (rawText === '#开启引用回复' || rawText === '#启用引用回复') {
+      currentConfig.enable_quote_reply = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启引用回复功能！管理员回复消息时，机器人将【引用回复】原好友/群聊的原始提问消息。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭引用回复' || rawText === '#停用引用回复' || rawText === '#禁用引用回复') {
+      currentConfig.enable_quote_reply = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已关闭引用回复功能，机器人回复时将直接发送普通消息。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 12. 快捷指令：开启/关闭在备注后显示原昵称
+    if (rawText === '#开启原名' || rawText === '#显示原名' || rawText === '#开启原昵称') {
+      currentConfig.show_original_nickname = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启原昵称显示！好友展示格式为：「备注名 (原昵称) (QQ号)」。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭原名' || rawText === '#隐藏原名' || rawText === '#关闭原昵称') {
+      currentConfig.show_original_nickname = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已关闭原昵称显示！好友展示格式将默认仅保留「备注名 (QQ号)」。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 13. 快捷指令：开启/关闭文件转发
+    if (rawText === '#开启文件转发' || rawText === '#启用文件转发') {
+      currentConfig.forward_file = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启文件转发功能！收到好友或群聊发送的文件时将自动向你推送。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭文件转发' || rawText === '#停用文件转发') {
+      currentConfig.forward_file = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已关闭文件转发功能。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 14. 快捷指令：强制刷新好友备注列表缓存 (#刷新好友 / #更新好友)
+    if (rawText === '#刷新好友' || rawText === '#更新好友' || rawText === '#同步好友') {
+      await refreshFriendCache(ctx, true);
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 好友备注信息已同步刷新！当前已缓存 ${friendCache.size} 位好友的备注与昵称。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 15. 检测引用回复
     let repliedMsgId = null;
 
     if (Array.isArray(event.message)) {
@@ -1000,48 +1173,69 @@ export const plugin_onmessage = async (ctx, event) => {
     // 执行回传原私聊发送者
     if (targetInfo.chat_type === 'private') {
       try {
+        let finalPayload = replyPayload;
+        if (currentConfig.enable_quote_reply && targetInfo.original_msg_id) {
+          if (Array.isArray(finalPayload)) {
+            finalPayload = [{ type: 'reply', data: { id: String(targetInfo.original_msg_id) } }, ...finalPayload];
+          } else {
+            finalPayload = `[CQ:reply,id=${targetInfo.original_msg_id}]` + finalPayload;
+          }
+        }
+
         await ctx.actions.call('send_private_msg', {
           user_id: targetInfo.sender_id,
-          message: replyPayload
+          message: finalPayload
         }, ctx.adapterName, ctx.pluginManager.config);
 
-        logger?.info(`[Relay] ✅ 成功将管理员回复转发给私聊好友 ${targetInfo.sender_name}(${targetInfo.sender_id})`);
+        // 获取最新格式化备注名
+        const currentDisplayName = await getUserDisplayName(ctx, targetInfo.sender_id, targetInfo.sender_name);
+
+        logger?.info(`[Relay] ✅ 成功将管理员回复转发给私聊好友 ${currentDisplayName}(${targetInfo.sender_id})`);
 
         if (currentConfig.send_confirmation) {
           await ctx.actions.call('send_private_msg', {
             user_id: targetQq,
-            message: `✅ 已成功回复给私聊好友: ${targetInfo.sender_name} (${targetInfo.sender_id})`
+            message: `✅ 已成功回复给私聊好友: ${currentDisplayName} (${targetInfo.sender_id})`
           }, ctx.adapterName, ctx.pluginManager.config);
         }
       } catch (err) {
         logger?.error(`[Relay] 转发回复给私聊好友失败:`, err);
+        const currentDisplayName = await getUserDisplayName(ctx, targetInfo.sender_id, targetInfo.sender_name);
         if (currentConfig.send_confirmation) {
           await ctx.actions.call('send_private_msg', {
             user_id: targetQq,
-            message: `❌ 回复给 ${targetInfo.sender_name}(${targetInfo.sender_id}) 失败: ${err.message || err}`
+            message: `❌ 回复给 ${currentDisplayName}(${targetInfo.sender_id}) 失败: ${err.message || err}`
           }, ctx.adapterName, ctx.pluginManager.config);
         }
       }
     } else if (targetInfo.chat_type === 'group') {
       // 执行回传原群聊
       try {
-        const atSeg = { type: 'at', data: { qq: targetInfo.sender_id } };
-        const spaceSeg = { type: 'text', data: { text: ' ' } };
-        const groupMsg = Array.isArray(replyPayload)
-          ? [atSeg, spaceSeg, ...replyPayload]
-          : [atSeg, spaceSeg, { type: 'text', data: { text: replyPayload } }];
+        let groupMsg = [];
+        if (currentConfig.enable_quote_reply && targetInfo.original_msg_id) {
+          groupMsg.push({ type: 'reply', data: { id: String(targetInfo.original_msg_id) } });
+        } else {
+          groupMsg.push({ type: 'at', data: { qq: targetInfo.sender_id } });
+          groupMsg.push({ type: 'text', data: { text: ' ' } });
+        }
+        if (Array.isArray(replyPayload)) {
+          groupMsg.push(...replyPayload);
+        } else {
+          groupMsg.push({ type: 'text', data: { text: replyPayload } });
+        }
 
         await ctx.actions.call('send_group_msg', {
           group_id: targetInfo.group_id,
           message: groupMsg
         }, ctx.adapterName, ctx.pluginManager.config);
 
-        logger?.info(`[Relay] ✅ 成功将管理员回复转发到群聊 ${targetInfo.group_id} 并@${targetInfo.sender_name}(${targetInfo.sender_id})`);
+        const currentDisplayName = await getUserDisplayName(ctx, targetInfo.sender_id, targetInfo.sender_name);
+        logger?.info(`[Relay] ✅ 成功将管理员回复转发到群聊 ${targetInfo.group_id} 并回复 ${currentDisplayName}(${targetInfo.sender_id})`);
 
         if (currentConfig.send_confirmation) {
           await ctx.actions.call('send_private_msg', {
             user_id: targetQq,
-            message: `✅ 已成功回复到群聊: ${targetInfo.group_name || targetInfo.group_id} (@${targetInfo.sender_name})`
+            message: `✅ 已成功回复到群聊: ${targetInfo.group_name || targetInfo.group_id} (@${currentDisplayName})`
           }, ctx.adapterName, ctx.pluginManager.config);
         }
       } catch (err) {
@@ -1071,7 +1265,75 @@ export const plugin_onmessage = async (ctx, event) => {
       return;
     }
 
-    const senderName = event.sender?.card || event.sender?.nickname || senderId;
+    // 获取发送者格式化名称（优先使用备注名）
+    const senderName = await getUserDisplayName(ctx, senderId, event.sender?.nickname);
+
+    // 检查是否为文件消息
+    const fileSeg = Array.isArray(event.message)
+      ? event.message.find(seg => seg.type === 'file' || seg.type === 'onlinefile')
+      : null;
+    const isFileMsg = Boolean(fileSeg || (event.raw_message && /\[CQ:file/i.test(event.raw_message)));
+
+    if (isFileMsg && currentConfig.forward_file) {
+      const fileName = fileSeg?.data?.file || fileSeg?.data?.fileName || '未知文件';
+      const fileSize = fileSeg?.data?.file_size || fileSeg?.data?.fileSize || 0;
+      const fileUrl = fileSeg?.data?.url || '';
+      const sizeText = formatFileSize(fileSize);
+
+      const fileNotice =
+        `📁 【收到私聊文件】\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        `👤 发送人: ${senderName} (${senderId})\n` +
+        `📄 文件名: ${fileName}\n` +
+        `📦 大小: ${sizeText}\n` +
+        (fileUrl ? `🔗 下载直链: ${fileUrl}\n` : '') +
+        `━━━━━━━━━━━━━━━\n` +
+        `💡 提示: 已向你转发 QQ 原生文件卡片。直接【引用回复】此消息即可回复对方。`;
+
+      try {
+        const res = await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: fileNotice
+        }, ctx.adapterName, ctx.pluginManager.config);
+
+        if (res && res.message_id) {
+          recordMessageMapping(res.message_id, {
+            sender_id: senderId,
+            sender_name: senderName,
+            chat_type: 'private',
+            original_msg_id: String(event.message_id),
+            time: Date.now()
+          });
+        }
+
+        // 调用 forward_friend_single_msg 进行 QQ 原生单条消息/文件卡片转发
+        try {
+          await ctx.actions.call('forward_friend_single_msg', {
+            message_id: event.message_id,
+            user_id: Number(targetQq)
+          }, ctx.adapterName, ctx.pluginManager.config);
+          logger?.info(`[Relay] 已成功将 ${senderName}(${senderId}) 的文件卡片转发至管理员`);
+        } catch (fwdErr) {
+          logger?.warn(`[Relay] forward_friend_single_msg 原生转发文件失败，尝试 upload_private_file:`, fwdErr);
+          if (fileUrl) {
+            try {
+              await ctx.actions.call('upload_private_file', {
+                user_id: targetQq,
+                file: fileUrl,
+                name: fileName
+              }, ctx.adapterName, ctx.pluginManager.config);
+              logger?.info(`[Relay] 通过 upload_private_file 成功将文件推达管理员`);
+            } catch (upErr) {
+              logger?.warn(`[Relay] upload_private_file 失败:`, upErr);
+            }
+          }
+        }
+      } catch (err) {
+        logger?.error(`[Relay] 转发文件通知失败:`, err);
+      }
+      return;
+    }
+
     const prefix = currentConfig.show_sender_info ? `[来自私聊: ${senderName}(${senderId})]:\n` : '';
 
     let forwardMsg = null;
@@ -1119,9 +1381,67 @@ export const plugin_onmessage = async (ctx, event) => {
       if (!isAtMe) return;
     }
 
-    const senderName = event.sender?.card || event.sender?.nickname || senderId;
+    // 群内优先使用群名片，若无群名片则获取备注名/昵称
+    const senderName = event.sender?.card || await getUserDisplayName(ctx, senderId, event.sender?.nickname);
     const groupId = String(event.group_id);
     const groupName = event.group_name || groupId;
+
+    // 检查是否为群文件
+    const fileSeg = Array.isArray(event.message)
+      ? event.message.find(seg => seg.type === 'file' || seg.type === 'onlinefile')
+      : null;
+    const isFileMsg = Boolean(fileSeg || (event.raw_message && /\[CQ:file/i.test(event.raw_message)));
+
+    if (isFileMsg && currentConfig.forward_file) {
+      const fileName = fileSeg?.data?.file || fileSeg?.data?.fileName || '未知文件';
+      const fileSize = fileSeg?.data?.file_size || fileSeg?.data?.fileSize || 0;
+      const fileUrl = fileSeg?.data?.url || '';
+      const sizeText = formatFileSize(fileSize);
+
+      const fileNotice =
+        `📁 【收到群聊文件】\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        `👥 来自群聊: ${groupName} (${groupId})\n` +
+        `👤 发送人: ${senderName} (${senderId})\n` +
+        `📄 文件名: ${fileName}\n` +
+        `📦 大小: ${sizeText}\n` +
+        (fileUrl ? `🔗 下载直链: ${fileUrl}\n` : '') +
+        `━━━━━━━━━━━━━━━\n` +
+        `💡 提示: 已向你转发文件卡片。直接【引用回复】此消息即可回复该群聊。`;
+
+      try {
+        const res = await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: fileNotice
+        }, ctx.adapterName, ctx.pluginManager.config);
+
+        if (res && res.message_id) {
+          recordMessageMapping(res.message_id, {
+            sender_id: senderId,
+            sender_name: senderName,
+            chat_type: 'group',
+            group_id: groupId,
+            group_name: groupName,
+            original_msg_id: String(event.message_id),
+            time: Date.now()
+          });
+        }
+
+        try {
+          await ctx.actions.call('forward_friend_single_msg', {
+            message_id: event.message_id,
+            user_id: Number(targetQq)
+          }, ctx.adapterName, ctx.pluginManager.config);
+          logger?.info(`[Relay] 已成功将群聊 [${groupName}] 内 ${senderName} 的文件卡片转发给管理员`);
+        } catch (fwdErr) {
+          logger?.warn(`[Relay] forward_friend_single_msg 转发群文件卡片失败:`, fwdErr);
+        }
+      } catch (err) {
+        logger?.error(`[Relay] 转发群文件通知失败:`, err);
+      }
+      return;
+    }
+
     const prefix = currentConfig.show_sender_info
       ? `[来自群聊: ${groupName}(${groupId}) - ${senderName}(${senderId})]:\n`
       : '';

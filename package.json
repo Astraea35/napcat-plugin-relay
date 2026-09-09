@@ -1,10 +1,10 @@
 {
   "name": "napcat-plugin-relay",
   "plugin": "消息中转传话",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "main": "index.mjs",
-  "description": "NapCat 消息双向中转与引用回复插件，支持QQ客户端免打扰智能过滤、好友申请一键审批及定时群发月薪喵表情包",
+  "description": "NapCat 消息双向中转与引用回复插件，支持备注名优先展示、引用回复原消息、私聊/群聊文件双向转发、免打扰智能过滤、好友申请一键审批及定时群发月薪喵表情包",
   "author": "Astraea35",
   "license": "MIT",
   "repository": {
