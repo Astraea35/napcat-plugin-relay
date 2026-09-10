@@ -30,6 +30,7 @@ let currentConfig = {
   enable_schedule: true,           // 是否开启定时群发
   schedule_groups: "",             // 目标群聊列表（支持逗号/空格/换行分隔，如：123456, 7891011）
   schedule_times: "09:00, 12:00, 18:00", // 每天定时发送时间点（24小时制 HH:mm，支持逗号分隔）
+  schedule_random_minutes: 0,      // 定时时间前后随机浮动时长 (分钟，0为固定时间准点发送，如填10表示在设定时间前后±10分钟内随机触发)
   schedule_text: "",               // 发送表情包时的附加文本
   schedule_custom_image: "",       // 自定义表情图片路径或 URL（留空使用内置月薪喵）
 };
@@ -274,11 +275,33 @@ async function findPendingFriendRequest(ctx, queryId) {
  */
 async function executeFriendRequestAction(ctx, reqInfo, approve, remark, targetQq) {
   try {
-    await ctx.actions.call('set_friend_add_request', {
-      flag: String(reqInfo.flag),
-      approve: approve,
-      remark: remark || ''
-    }, ctx.adapterName, ctx.pluginManager.config);
+    let actionSucceeded = false;
+    try {
+      await ctx.actions.call('set_friend_add_request', {
+        flag: String(reqInfo.flag),
+        approve: approve,
+        remark: remark || ''
+      }, ctx.adapterName, ctx.pluginManager.config);
+      actionSucceeded = true;
+    } catch (apiErr) {
+      logger?.warn('[Relay] set_friend_add_request 异常，尝试检测是否已为好友:', apiErr);
+      // 如果对方已经是好友（例如单向好友已互粉或QQ已自动通过），尝试直接设置备注
+      if (approve && remark) {
+        try {
+          await ctx.actions.call('set_friend_remark', {
+            user_id: Number(reqInfo.user_id),
+            remark: remark
+          }, ctx.adapterName, ctx.pluginManager.config);
+          actionSucceeded = true;
+        } catch (rErr) {
+          logger?.warn('[Relay] set_friend_remark 失败:', rErr);
+        }
+      } else if (approve) {
+        actionSucceeded = true;
+      } else {
+        throw apiErr;
+      }
+    }
 
     // 清理已处理的申请记录
     pendingFriendRequests.delete(String(reqInfo.user_id));
@@ -312,30 +335,17 @@ async function executeFriendRequestAction(ctx, reqInfo, approve, remark, targetQ
 }
 
 /**
- * 处理好友申请事件
+ * 统一处理好友申请：自动同意或向管理员推送交互审核卡片
  */
-async function handleFriendRequestEvent(ctx, event) {
+async function processFriendRequestAndNotify(ctx, reqInfo, targetQq) {
   if (!currentConfig.forward_friend_request) return;
 
-  const targetQq = String(currentConfig.target_qq || '').trim();
-  if (!targetQq) return;
+  const applicantId = String(reqInfo.user_id || '').trim();
+  const displayName = reqInfo.nickname || await getUserDisplayName(ctx, applicantId, applicantId);
+  const flag = String(reqInfo.flag || '');
+  const comment = reqInfo.comment || '';
 
-  const applicantId = String(event.user_id || '').trim();
-  const flag = String(event.flag || '');
-  const comment = event.comment || '';
-
-  // 1. 获取申请人备注名或昵称 (优先备注名)
-  const displayName = await getUserDisplayName(ctx, applicantId, applicantId);
-
-  const reqInfo = {
-    user_id: applicantId,
-    nickname: displayName,
-    flag,
-    comment,
-    time: event.time ? Number(event.time) * 1000 : Date.now()
-  };
-
-  // 2. 检查自动同意逻辑
+  // 1. 检查自动同意逻辑
   const kw = (currentConfig.auto_approve_keyword || '').trim();
   const matchKw = kw && comment.includes(kw);
   if (currentConfig.auto_approve_friend || matchKw) {
@@ -352,12 +362,12 @@ async function handleFriendRequestEvent(ctx, event) {
       }, ctx.adapterName, ctx.pluginManager.config);
       return;
     } catch (err) {
-      logger?.error('[Relay] 自动同意好友申请失败:', err);
+      logger?.warn('[Relay] 自动同意好友申请 set_friend_add_request 异常 (可能已是好友):', err);
     }
   }
 
-  // 3. 构建并向管理员推送审核通知卡片
-  const timeStr = new Date(reqInfo.time).toLocaleString('zh-CN', { hour12: false });
+  // 2. 构建并向管理员推送审核通知卡片
+  const timeStr = new Date(reqInfo.time || Date.now()).toLocaleString('zh-CN', { hour12: false });
   const notifyText =
     `👤 【收到新的好友申请】\n` +
     `━━━━━━━━━━━━━━━\n` +
@@ -367,8 +377,8 @@ async function handleFriendRequestEvent(ctx, event) {
     `━━━━━━━━━━━━━━━\n` +
     `👉 处理方式（二选一）:\n` +
     `1. 直接【引用回复】本消息：\n` +
-    `   • 回复「同意」或「同意 备注名」通过申请\n` +
-    `   • 回复「拒绝」拒绝申请\n` +
+    `   • 回复「同意」或「同意 备注名」（支持 /同意、#同意）\n` +
+    `   • 回复「拒绝」（支持 /拒绝、#拒绝）\n` +
     `2. 发送指令：\n` +
     `   • #同意 ${applicantId} [备注名]\n` +
     `   • #拒绝 ${applicantId}`;
@@ -385,7 +395,7 @@ async function handleFriendRequestEvent(ctx, event) {
       recordMessageMapping(sentId, {
         is_friend_request: true,
         user_id: applicantId,
-        nickname,
+        nickname: displayName,
         flag,
         comment,
         time: Date.now()
@@ -396,10 +406,37 @@ async function handleFriendRequestEvent(ctx, event) {
     pendingFriendRequests.set(applicantId, reqInfo);
     pendingFriendRequests.set(flag, reqInfo);
 
-    logger?.info(`[Relay] 已将 ${nickname}(${applicantId}) 的好友申请推达管理员 QQ: ${targetQq}`);
+    logger?.info(`[Relay] 已将 ${displayName}(${applicantId}) 的好友申请推达管理员 QQ: ${targetQq}`);
   } catch (err) {
     logger?.error('[Relay] 推送好友申请至管理员失败:', err);
   }
+}
+
+/**
+ * 处理好友申请事件 (OneBot 11 request.friend)
+ */
+async function handleFriendRequestEvent(ctx, event) {
+  if (!currentConfig.forward_friend_request) return;
+
+  const targetQq = String(currentConfig.target_qq || '').trim();
+  if (!targetQq) return;
+
+  const applicantId = String(event.user_id || '').trim();
+  const flag = String(event.flag || '');
+  const comment = event.comment || '';
+
+  // 获取申请人备注名或昵称 (优先备注名)
+  const displayName = await getUserDisplayName(ctx, applicantId, applicantId);
+
+  const reqInfo = {
+    user_id: applicantId,
+    nickname: displayName,
+    flag,
+    comment,
+    time: event.time ? Number(event.time) * 1000 : Date.now()
+  };
+
+  await processFriendRequestAndNotify(ctx, reqInfo, targetQq);
 }
 
 /**
@@ -522,7 +559,90 @@ async function isChatDND(ctx, event) {
 
 let catImageBase64Cache = null;
 let scheduleTimer = null;
-let lastTriggerMinute = '';
+// 今日随机调度计划: slot ("09:00") -> { slot, targetTimestamp, targetTimeStr, triggered: boolean, offsetMinutes: string }
+const dailySchedulePlan = new Map();
+let currentPlanDate = '';
+
+/**
+ * 生成或更新当天的定时任务随机执行计划
+ * @param {Date} now 当前时间
+ * @param {boolean} force 是否强制重新计算未触发任务的随机时间
+ */
+function generateDailySchedulePlan(now = new Date(), force = false) {
+  const currentDateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const isNewDay = currentPlanDate !== currentDateStr;
+
+  if (isNewDay) {
+    dailySchedulePlan.clear();
+    currentPlanDate = currentDateStr;
+  }
+
+  const configuredTimes = (currentConfig.schedule_times || '')
+    .split(/[,，\s]+/)
+    .map(t => t.trim())
+    .filter(Boolean)
+    .map(t => {
+      const parts = t.split(':');
+      if (parts.length === 2) {
+        return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+      }
+      return t;
+    })
+    .filter(t => /^\d{2}:\d{2}$/.test(t));
+
+  const randomMinutes = Math.max(0, Number(currentConfig.schedule_random_minutes) || 0);
+
+  for (const slot of configuredTimes) {
+    const existing = dailySchedulePlan.get(slot);
+    // 如果今天该时段已经触发过且不是强制重算，保留
+    if (existing && existing.triggered && !force && !isNewDay) {
+      continue;
+    }
+    // 如果已有未触发的计划且不是强制重算，保留
+    if (existing && !force && !isNewDay) {
+      continue;
+    }
+
+    const [h, m] = slot.split(':').map(Number);
+    const baseDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+
+    let offsetSeconds = 0;
+    if (randomMinutes > 0) {
+      // 随机范围: [-randomMinutes * 60, +randomMinutes * 60] 秒
+      const maxOffsetSec = randomMinutes * 60;
+      offsetSeconds = Math.floor(Math.random() * (2 * maxOffsetSec + 1)) - maxOffsetSec;
+    }
+
+    const targetDate = new Date(baseDate.getTime() + offsetSeconds * 1000);
+    const targetH = String(targetDate.getHours()).padStart(2, '0');
+    const targetM = String(targetDate.getMinutes()).padStart(2, '0');
+    const targetS = String(targetDate.getSeconds()).padStart(2, '0');
+    const targetTimeStr = `${targetH}:${targetM}:${targetS}`;
+
+    // 如果计算出的计划时间已经过去超过60秒且并非强制更新，判定为已过时
+    const isPast = targetDate.getTime() < now.getTime() - 60000;
+
+    dailySchedulePlan.set(slot, {
+      slot,
+      targetTimestamp: targetDate.getTime(),
+      targetTimeStr,
+      triggered: isPast && !force ? true : (existing?.triggered || false),
+      offsetMinutes: (offsetSeconds / 60).toFixed(1)
+    });
+  }
+
+  // 清理不再配置的 slot
+  for (const key of dailySchedulePlan.keys()) {
+    if (!configuredTimes.includes(key)) {
+      dailySchedulePlan.delete(key);
+    }
+  }
+
+  const planSummary = Array.from(dailySchedulePlan.entries())
+    .map(([k, v]) => `${k} -> 预计 ${v.targetTimeStr} (${v.triggered ? '已触发' : '待触发'})`)
+    .join('; ');
+  logger?.info?.(`[Relay Schedule] 今日定时发送执行计划已就绪 (${currentDateStr}): ${planSummary || '无有效配置'}`);
+}
 
 /**
  * 获取内置月薪喵表情包的 Base64 编码
@@ -620,47 +740,36 @@ function startScheduler(ctx) {
     scheduleTimer = null;
   }
 
+  // 启动时初次生成今日计划
+  generateDailySchedulePlan(new Date());
+
   scheduleTimer = setInterval(async () => {
     try {
       if (!currentConfig.enable_schedule) return;
 
       const now = new Date();
-      const hours = String(now.getHours()).padStart(2, '0');
-      const minutes = String(now.getMinutes()).padStart(2, '0');
-      const currentTimeStr = `${hours}:${minutes}`;
       const currentDateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      const triggerKey = `${currentDateStr} ${currentTimeStr}`;
 
-      if (lastTriggerMinute === triggerKey) {
-        return; // 该分钟已执行
+      // 跨天自动切换并生成新一天计划
+      if (currentPlanDate !== currentDateStr) {
+        generateDailySchedulePlan(now);
       }
 
-      const configuredTimes = (currentConfig.schedule_times || '')
-        .split(/[,，\s]+/)
-        .map(t => t.trim())
-        .filter(Boolean)
-        .map(t => {
-          const parts = t.split(':');
-          if (parts.length === 2) {
-            return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
-          }
-          return t;
-        });
+      for (const [slot, plan] of dailySchedulePlan.entries()) {
+        if (!plan.triggered && now.getTime() >= plan.targetTimestamp) {
+          plan.triggered = true;
+          const randomInfo = Number(currentConfig.schedule_random_minutes) > 0 ? ` (随机浮动: ${plan.offsetMinutes}分)` : '';
+          logger?.info(`[Relay Schedule] ⏰ 到达计划发送时间: ${plan.targetTimeStr} [设定时段: ${slot}${randomInfo}]，开始执行群聊广播...`);
 
-      if (!configuredTimes.includes(currentTimeStr)) {
-        return;
+          await sendCatToConfiguredGroups(ctx, `定时任务(${slot} 实际:${plan.targetTimeStr})`);
+        }
       }
-
-      lastTriggerMinute = triggerKey;
-      logger?.info(`[Relay Schedule] ⏰ 到达定时发送时间点: ${currentTimeStr}，开始执行群聊广播...`);
-
-      await sendCatToConfiguredGroups(ctx, `定时任务(${currentTimeStr})`);
     } catch (err) {
       logger?.error('[Relay Schedule] 定时任务轮询执行异常:', err);
     }
-  }, 25000);
+  }, 15000); // 15秒高频轮询保证秒级准时
 
-  logger?.info('[Relay Schedule] 定时调度引擎已启动 (轮询周期: 25秒)');
+  logger?.info('[Relay Schedule] 定时调度引擎已启动 (轮询周期: 15秒，支持时间点前后随机浮动)');
 }
 
 /**
@@ -727,6 +836,7 @@ export const plugin_init = async (ctx) => {
       ctx.NapCatConfig.boolean("enable_schedule", "开启定时发送", true, "是否启用每日固定时间群发月薪喵表情包"),
       ctx.NapCatConfig.text("schedule_groups", "定时发送目标群号", "", "需要定时发送表情包的群号列表，支持多个群号，用逗号、空格或换行分隔（如：123456, 7891011）"),
       ctx.NapCatConfig.text("schedule_times", "每日定时发送时间点", "09:00, 12:00, 18:00", "24小时制 HH:mm，多个时间用逗号分隔，例如：09:00, 12:00, 18:00"),
+      ctx.NapCatConfig.number("schedule_random_minutes", "随机浮动范围 (分钟)", 0, "设置定时发送在设定时间点前后随机浮动的分钟数，例如填 10 则在设定时间前后 ±10 分钟内随机触发；填 0 为固定时间准点发送"),
       ctx.NapCatConfig.text("schedule_text", "附带文本说明 (可选)", "", "发送表情包时随图附带的文字，留空则纯发表情包"),
       ctx.NapCatConfig.text("schedule_custom_image", "自定义表情图片 (可选)", "", "留空则默认使用内置的最新月薪喵动态表情；可填写本地绝对路径、网络图片URL或 base64://")
     );
@@ -770,6 +880,12 @@ export const plugin_onmessage = async (ctx, event) => {
     if (rawText === '#中转状态' || rawText === '#relay' || rawText === '#relay status') {
       const dndCount = (currentConfig.dnd_list || []).length;
       const dndPreview = dndCount > 0 ? (currentConfig.dnd_list.slice(0, 5).join(', ') + (dndCount > 5 ? ` 等共${dndCount}个` : '')) : '无';
+      const randomMins = Number(currentConfig.schedule_random_minutes) || 0;
+      const randomDesc = randomMins > 0 ? `前后随机 ±${randomMins} 分钟` : '准点发送 (未开启随机)';
+      const planList = Array.from(dailySchedulePlan.entries())
+        .map(([slot, p]) => `  • ${slot} 档 ➔ 今日计划 ${p.targetTimeStr} (${p.triggered ? '✅已触发' : '⏳待触发'})`)
+        .join('\n');
+
       const statusText =
         `🤖 【消息中转传话插件运行状态】\n` +
         `━━━━━━━━━━━━━━━\n` +
@@ -786,8 +902,10 @@ export const plugin_onmessage = async (ctx, event) => {
         `📋 手动免打扰名单: ${dndPreview}\n` +
         `🔔 发送回执: ${currentConfig.send_confirmation ? '✅ 开启' : '❌ 关闭'}\n` +
         `⏰ 定时月薪喵: ${currentConfig.enable_schedule ? '✅ 开启' : '❌ 关闭'}\n` +
-        `🕒 每日触发时间: ${currentConfig.schedule_times || '未设置'}\n` +
+        `🕒 设定时间点: ${currentConfig.schedule_times || '未设置'}\n` +
+        `🎲 随机时间浮动: ${randomDesc}\n` +
         `📢 定时目标群聊: ${currentConfig.schedule_groups || '未配置'}\n` +
+        (planList ? `📅 今日执行计划:\n${planList}\n` : '') +
         `📊 活跃引用映射条数: ${messageMap.size} 条 | 好友缓存: ${friendCache.size} 位\n` +
         `━━━━━━━━━━━━━━━\n` +
         `💡 快捷管理指令:\n` +
@@ -799,6 +917,7 @@ export const plugin_onmessage = async (ctx, event) => {
         `• 发送 #测试月薪喵 [群号] / #月薪喵\n` +
         `• 发送 #设置群聊 <群号1,群号2...>\n` +
         `• 发送 #设置时间 <09:00,12:00,18:00>\n` +
+        `• 发送 #设置随机 <分钟数> (设置时间前后随机浮动)\n` +
         `• 发送 #开启月薪喵 / #关闭月薪喵\n` +
         `• 发送 #同意 <QQ号> [备注名] / #拒绝 <QQ号>\n` +
         `• 发送 #免打扰 查看免打扰设置与指令`;
@@ -984,9 +1103,42 @@ export const plugin_onmessage = async (ctx, event) => {
       const input = setTimesMatch[1].trim();
       currentConfig.schedule_times = input;
       saveConfigToFile();
+      generateDailySchedulePlan(new Date(), true);
+      const planDesc = Array.from(dailySchedulePlan.entries())
+        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.triggered ? '✅已执行' : '⏳待执行'})`)
+        .join('\n');
       await ctx.actions.call('send_private_msg', {
         user_id: targetQq,
-        message: `✅ 已成功更新每日定时发送时间点：\n${input}\n\n系统将在每天上述设定时间向目标群聊自动发送月薪喵表情包。`
+        message: `✅ 已成功更新每日定时发送时间点：\n${input}\n\n📅 今日更新后的执行计划：\n${planDesc || '(未设置发送时间点)'}`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 9.1 快捷指令：设置定时前后随机浮动时长 (#设置随机 <分钟数> / #设置随机时间 <分钟数>)
+    const setRandomMatch = rawText.match(/^#(?:设置随机时间|设置随机|配置随机|随机时间|随机时长)(?:\s+(\d+))?$/);
+    if (setRandomMatch) {
+      const param = setRandomMatch[1]?.trim();
+      if (param === undefined) {
+        const currentMins = Number(currentConfig.schedule_random_minutes) || 0;
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `🕒 当前定时发送随机浮动范围: ${currentMins > 0 ? `前后 ±${currentMins} 分钟` : '准点发送 (0 分钟)'}\n\n💡 指令用法:\n• 发送 #设置随机 10 (设置为时间点前后 ±10 分钟随机触发)\n• 发送 #设置随机 0 (关闭随机浮动，准点发送)`
+        }, ctx.adapterName, ctx.pluginManager.config);
+        return;
+      }
+      const minutes = parseInt(param, 10);
+      currentConfig.schedule_random_minutes = minutes;
+      saveConfigToFile();
+      generateDailySchedulePlan(new Date(), true);
+      const planDesc = Array.from(dailySchedulePlan.entries())
+        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.triggered ? '✅已执行' : '⏳待执行'})`)
+        .join('\n');
+      const tip = minutes > 0
+        ? `✅ 已设置定时发送前后随机浮动时长为: ±${minutes} 分钟！\n每次发送将在设定时间点的前后 ${minutes} 分钟内随机触发。\n\n📅 今日更新后的执行计划：\n${planDesc || '(未设置发送时间点)'}`
+        : `✅ 已关闭定时发送随机浮动，后续将按设定时间点准点发送。\n\n📅 今日更新后的执行计划：\n${planDesc || '(未设置发送时间点)'}`;
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: tip
       }, ctx.adapterName, ctx.pluginManager.config);
       return;
     }
@@ -1136,15 +1288,15 @@ export const plugin_onmessage = async (ctx, event) => {
     }
 
     if (friendReq) {
-      // 检查管理员输入是否为同意或拒绝
-      const isApprove = /^(?:同意|通过|接收|接受|ok|yes)(?:\s+(.+))?$/i.exec(cleanText);
+      // 检查管理员输入是否为同意或拒绝 (支持 /同意, #同意, 同意 等)
+      const isApprove = /^[/#]?(?:同意|通过|接收|接受|ok|yes)(?:\s+(.+))?$/i.exec(cleanText);
       if (isApprove) {
         const remark = (isApprove[1] || '').trim();
         await executeFriendRequestAction(ctx, friendReq, true, remark, targetQq);
         return;
       }
 
-      const isReject = /^(?:拒绝|不通过|忽略|no)$/i.test(cleanText);
+      const isReject = /^[/#]?(?:拒绝|不通过|忽略|no)$/i.test(cleanText);
       if (isReject) {
         await executeFriendRequestAction(ctx, friendReq, false, '', targetQq);
         return;
@@ -1153,7 +1305,7 @@ export const plugin_onmessage = async (ctx, event) => {
       // 如果既不是同意也不是拒绝，向管理员友好提示操作格式
       await ctx.actions.call('send_private_msg', {
         user_id: targetQq,
-        message: `💡 【好友申请处理提示】\n检测到你正在引用回复好友申请通知：\n• 发送「同意」或「同意 备注名」通过申请\n• 发送「拒绝」拒绝申请`
+        message: `💡 【好友申请处理提示】\n检测到你正在引用回复好友申请通知：\n• 发送「同意」或「同意 备注名」（支持 /同意）通过申请\n• 发送「拒绝」（支持 /拒绝）拒绝申请`
       }, ctx.adapterName, ctx.pluginManager.config);
       return;
     }
@@ -1163,6 +1315,40 @@ export const plugin_onmessage = async (ctx, event) => {
     if (!targetInfo) {
       logger?.debug(`[Relay] 管理员引用的消息ID (${repliedMsgId}) 不在转发映射表中，可能已过期或并非转发消息`);
       return;
+    }
+
+    // 智能兜底：如果管理员引用了普通消息却发送了 /同意、同意、/拒绝
+    const smartApprove = /^[/#]?(?:同意|通过|接收|接受|ok|yes)(?:\s+(.+))?$/i.exec(cleanText);
+    const smartReject = /^[/#]?(?:拒绝|不通过|忽略|no)$/i.test(cleanText);
+    if (smartApprove || smartReject) {
+      const senderUin = String(targetInfo.sender_id);
+      const pendingReq = await findPendingFriendRequest(ctx, senderUin) || pendingFriendRequests.get(senderUin);
+      if (pendingReq) {
+        logger?.info(`[Relay] 管理员引用了普通消息并回复同意/拒绝，智能转为处理该用户好友申请: ${senderUin}`);
+        await executeFriendRequestAction(ctx, pendingReq, Boolean(smartApprove), smartApprove?.[1]?.trim(), targetQq);
+        return;
+      }
+      // 如果已在好友列表中，且管理员回复 /同意 备注名，智能更新备注
+      if (friendCache.has(senderUin)) {
+        if (smartApprove) {
+          const remark = smartApprove[1]?.trim();
+          if (remark) {
+            try {
+              await ctx.actions.call('set_friend_remark', { user_id: Number(senderUin), remark }, ctx.adapterName, ctx.pluginManager.config);
+              friendCache.set(senderUin, { nickname: targetInfo.sender_name || '', remark, lastUpdated: Date.now() });
+              await ctx.actions.call('send_private_msg', { user_id: targetQq, message: `✅ 该用户已在好友列表中，已为你成功更新其备注名: ${remark} (${senderUin})` }, ctx.adapterName, ctx.pluginManager.config);
+            } catch (e) {
+              await ctx.actions.call('send_private_msg', { user_id: targetQq, message: `✅ 该用户已在好友列表中。更新备注失败: ${e.message || e}` }, ctx.adapterName, ctx.pluginManager.config);
+            }
+          } else {
+            await ctx.actions.call('send_private_msg', { user_id: targetQq, message: `✅ 该用户已在好友列表中，无需重复通过申请。若需设置备注名可回复「/同意 备注名」` }, ctx.adapterName, ctx.pluginManager.config);
+          }
+          return;
+        } else if (smartReject) {
+          await ctx.actions.call('send_private_msg', { user_id: targetQq, message: `⚠️ 该用户已是好友。如需屏蔽该会话请发送 #添加免打扰 ${senderUin}` }, ctx.adapterName, ctx.pluginManager.config);
+          return;
+        }
+      }
     }
 
     if (!replyPayload || (Array.isArray(replyPayload) && replyPayload.length === 0)) {
@@ -1267,6 +1453,31 @@ export const plugin_onmessage = async (ctx, event) => {
 
     // 获取发送者格式化名称（优先使用备注名）
     const senderName = await getUserDisplayName(ctx, senderId, event.sender?.nickname);
+
+    // 检查是否为 QQ 好友申请提示 (如 QQ 私聊发送的 "请求添加你为好友")
+    const rawCleanText = (event.raw_message || '').trim();
+    const isFriendReqText = /^(?:请求添加(?:你|对方)为好友|请求加为好友|加为好友|申请添加你为好友)/i.test(rawCleanText);
+    let detectedPendingReq = null;
+    if (isFriendReqText) {
+      detectedPendingReq = await findPendingFriendRequest(ctx, senderId);
+    }
+    if (isFriendReqText || detectedPendingReq) {
+      logger?.info(`[Relay] 拦截到私聊好友申请通知: "${rawCleanText}" (来自: ${senderId})`);
+      const flag = detectedPendingReq?.flag || String(event.time || Date.now());
+      const comment = detectedPendingReq?.comment || (isFriendReqText ? rawCleanText : '');
+      const reqTime = detectedPendingReq?.time || (event.time ? Number(event.time) * 1000 : Date.now());
+
+      const reqInfo = {
+        user_id: senderId,
+        nickname: senderName,
+        flag,
+        comment,
+        time: reqTime
+      };
+
+      await processFriendRequestAndNotify(ctx, reqInfo, targetQq);
+      return;
+    }
 
     // 检查是否为文件消息
     const fileSeg = Array.isArray(event.message)
