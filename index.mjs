@@ -33,10 +33,12 @@ let currentConfig = {
   // 定时群发月薪喵表情包配置
   enable_schedule: true,           // 是否开启定时群发
   schedule_groups: "",             // 目标群聊列表（支持逗号/空格/换行分隔，如：123456, 7891011）
-  schedule_times: "09:00, 12:00, 18:00", // 每天定时发送时间点（24小时制 HH:mm，支持逗号分隔）
-  schedule_random_minutes: 0,      // 定时时间前后随机浮动时长 (分钟，0为固定时间准点发送，如填10表示在设定时间前后±10分钟内随机触发)
+  schedule_times: "12:30",         // 每天定时发送时间点（改为中午12:30）
+  schedule_random_minutes: 0,      // 定时时间前后随机浮动时长 (分钟，0为固定时间准点发送)
   schedule_text: "",               // 发送表情包时的附加文本
   schedule_custom_image: "",       // 自定义表情图片路径或 URL（留空使用内置月薪喵）
+  enable_schedule_activity_check: true, // 是否开启群活跃度防刷屏检测（防止死群刷屏被踢）
+  schedule_min_other_msgs: 5,      // 群内其他成员发言门槛（自上次发送后至少需5条消息才发下一次）
 };
 
 // 内存中的消息映射: sent_msg_id -> target info
@@ -46,6 +48,10 @@ const messageMap = new Map();
 const MAX_MAP_SIZE = 5000;
 let saveTimer = null;
 let dataDir = '';
+
+// 群定时活跃度追踪: groupId -> { lastSentDate, lastSentTime, otherMsgCount, waitingForActivity }
+const groupActivityMap = new Map();
+let groupActivitySaveTimer = null;
 
 // 受保护群的期望名片映射: groupId -> expectedCard
 const protectedGroupCards = new Map();
@@ -925,6 +931,93 @@ async function isChatDND(ctx, event) {
 }
 
 // ========================================================
+// 群定时活跃度追踪与防刷屏持久化模块
+// ========================================================
+
+/**
+ * 获取今日日期字符串 YYYY-MM-DD
+ */
+function getTodayDateStr(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * 获取指定群的活跃度记录
+ */
+function getGroupActivity(groupId) {
+  const gId = String(groupId).trim();
+  if (!groupActivityMap.has(gId)) {
+    groupActivityMap.set(gId, {
+      lastSentDate: '',
+      lastSentTime: 0,
+      otherMsgCount: 0,
+      waitingForActivity: false
+    });
+  }
+  return groupActivityMap.get(gId);
+}
+
+/**
+ * 从磁盘加载群定时活跃度记录
+ */
+function loadGroupActivity() {
+  try {
+    if (!dataDir) return;
+    const file = path.join(dataDir, 'group_schedule_activity.json');
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      if (typeof data === 'object' && data !== null) {
+        groupActivityMap.clear();
+        for (const [gid, val] of Object.entries(data)) {
+          if (gid && typeof val === 'object' && val !== null) {
+            groupActivityMap.set(String(gid).trim(), {
+              lastSentDate: String(val.lastSentDate || ''),
+              lastSentTime: Number(val.lastSentTime) || 0,
+              otherMsgCount: Number(val.otherMsgCount) || 0,
+              waitingForActivity: Boolean(val.waitingForActivity)
+            });
+          }
+        }
+        logger?.info(`[Relay Schedule] 成功从磁盘加载 ${groupActivityMap.size} 个群的活跃度防刷屏记录`);
+      }
+    }
+  } catch (e) {
+    logger?.warn('[Relay Schedule] 读取群活跃度记录失败:', e);
+  }
+}
+
+/**
+ * 保存群定时活跃度记录到磁盘
+ */
+function saveGroupActivity() {
+  try {
+    if (!dataDir) return;
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    const file = path.join(dataDir, 'group_schedule_activity.json');
+    const obj = {};
+    for (const [gid, val] of groupActivityMap.entries()) {
+      obj[gid] = val;
+    }
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch (e) {
+    logger?.warn('[Relay Schedule] 保存群活跃度记录失败:', e);
+  }
+}
+
+/**
+ * 防抖保存群定时活跃度记录 (5秒防抖)
+ */
+function saveGroupActivityDebounced() {
+  if (groupActivitySaveTimer) return;
+  groupActivitySaveTimer = setTimeout(() => {
+    groupActivitySaveTimer = null;
+    saveGroupActivity();
+  }, 5000);
+}
+
+// ========================================================
 // 定时群发月薪喵表情包核心调度模块
 // ========================================================
 
@@ -1086,15 +1179,47 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
   });
 
   let successCount = 0;
+  let deferredCount = 0;
   let failCount = 0;
+  const isSingleGroup = Boolean(targetGroupOverride);
+  const todayStr = getTodayDateStr();
+  const minMsgs = Math.max(1, Number(currentConfig.schedule_min_other_msgs) || 5);
 
   for (const gid of groups) {
+    const activity = getGroupActivity(gid);
+
+    // 仅在定时群发批处理时做活跃门槛校验；单群补发或手动测试群发直接放行
+    if (!isSingleGroup && currentConfig.enable_schedule_activity_check) {
+      // 1. 如果该群今天已经发送过，直接跳过避免重复发送
+      if (activity.lastSentDate === todayStr) {
+        logger?.info(`[Relay Schedule] ${sourceLabel}: 群 [${gid}] 今日已完成定时发送，跳过`);
+        continue;
+      }
+
+      // 2. 如果非新群首次发送，检查群内其他成员发言是否达到门槛
+      if (activity.lastSentTime > 0 && activity.otherMsgCount < minMsgs) {
+        activity.waitingForActivity = true;
+        deferredCount++;
+        saveGroupActivityDebounced();
+        logger?.warn(`[Relay Schedule] ⏳ ${sourceLabel}: 群 [${gid}] 自上次发送后群内其他成员仅发言 ${activity.otherMsgCount}/${minMsgs} 条（未达门槛），暂缓发送今日定时消息以防被管理判为刷屏，待群内累计达到 ${minMsgs} 条发言后再自动补发`);
+        continue;
+      }
+    }
+
     try {
       await ctx.actions.call('send_group_msg', {
         group_id: Number(gid),
         message: msgElements
       }, ctx.adapterName, ctx.pluginManager?.config);
       successCount++;
+
+      // 更新该群的发送与活跃状态
+      activity.lastSentDate = todayStr;
+      activity.lastSentTime = Date.now();
+      activity.otherMsgCount = 0;
+      activity.waitingForActivity = false;
+      saveGroupActivityDebounced();
+
       logger?.info(`[Relay Schedule] ✅ ${sourceLabel}: 已成功发送月薪喵表情包至群聊: ${gid}`);
     } catch (err) {
       failCount++;
@@ -1103,12 +1228,71 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
   }
 
   return {
-    success: successCount > 0,
+    success: successCount > 0 || deferredCount > 0,
     successCount,
+    deferredCount,
     failCount,
     total: groups.length,
-    message: `成功发送至 ${successCount}/${groups.length} 个群聊`
+    message: `成功发送至 ${successCount} 个群聊${deferredCount > 0 ? `，暂缓 ${deferredCount} 个群聊等待活跃` : ''}`
   };
+}
+
+/**
+ * 监听群消息活跃度：累加非机器人消息并在达到防刷门槛时自动触发今日定时补发
+ */
+async function handleGroupActivityOnMessage(ctx, event) {
+  if (!event || event.message_type !== 'group') return;
+
+  const gid = String(event.group_id).trim();
+  if (!gid) return;
+
+  const configuredGroups = (currentConfig.schedule_groups || '')
+    .split(/[,，\s\n]+/)
+    .map(g => g.trim())
+    .filter(g => /^\d+$/.test(g));
+
+  if (!configuredGroups.includes(gid)) return;
+
+  const activity = getGroupActivity(gid);
+  activity.otherMsgCount = (activity.otherMsgCount || 0) + 1;
+  saveGroupActivityDebounced();
+
+  if (!currentConfig.enable_schedule || !currentConfig.enable_schedule_activity_check) return;
+
+  const now = new Date();
+  const todayStr = getTodayDateStr(now);
+
+  // 1. 若今日该群已发过，无需补发
+  if (activity.lastSentDate === todayStr) return;
+
+  // 2. 检查今日定时任务的最早时间是否已到（未到中午定时时间不提前发）
+  let scheduledTimeReached = false;
+  if (dailySchedulePlan.size > 0) {
+    for (const plan of dailySchedulePlan.values()) {
+      if (now.getTime() >= plan.targetTimestamp) {
+        scheduledTimeReached = true;
+        break;
+      }
+    }
+  } else {
+    // 兜底：若计划尚未生成，按配置的第一个时间计算
+    const firstTime = (currentConfig.schedule_times || '12:30').split(/[,，\s]+/)[0] || '12:30';
+    const [h, m] = firstTime.split(':').map(Number);
+    const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h || 12, m || 30, 0, 0);
+    scheduledTimeReached = now.getTime() >= target.getTime();
+  }
+
+  if (!scheduledTimeReached) return;
+
+  // 3. 检查自上次发送后其他成员累计发言是否达到门槛
+  const minMsgs = Math.max(1, Number(currentConfig.schedule_min_other_msgs) || 5);
+  if (activity.otherMsgCount >= minMsgs) {
+    logger?.info(`[Relay Schedule] 🚀 检测到群 [${gid}] 其他成员发言累计已达 ${activity.otherMsgCount}/${minMsgs} 条（活跃度达标），触发今日定时表情包自动补发！`);
+    const result = await sendCatToConfiguredGroups(ctx, `活跃达标补发(${activity.otherMsgCount}条)`, gid);
+    if (result.success) {
+      logger?.info(`[Relay Schedule] ✅ 群 [${gid}] 自动补发完成，今日定时任务已完成`);
+    }
+  }
 }
 
 /**
@@ -1195,8 +1379,9 @@ export const plugin_init = async (ctx) => {
     logger.warn("[Relay] 读取配置文件失败，使用默认配置:", err);
   }
 
-  // 2. 加载历史消息映射
+  // 2. 加载历史消息映射与群活跃度记录
   loadMessageMap();
+  loadGroupActivity();
 
   // 3. 启动定时任务调度器
   startScheduler(ctx);
@@ -1242,14 +1427,16 @@ export const plugin_init = async (ctx) => {
       // 定时发送月薪喵表情包配置
       ctx.NapCatConfig.html(
         '<div style="margin: 15px 0 10px; padding: 12px; background: rgba(64, 158, 255, 0.08); border-left: 4px solid #409eff; border-radius: 4px;">' +
-        '  <h4 style="margin: 0 0 5px; color: #409eff;">⏰ 定时发送月薪喵表情包</h4>' +
-        '  <span style="font-size: 13px; color: #666;">支持在每天固定时间自动向指定的QQ群批量发送最新月薪喵打工表情包。群号与发送时间均可自定义。</span>' +
+        '  <h4 style="margin: 0 0 5px; color: #409eff;">⏰ 定时发送月薪喵表情包 (防死群刷屏版)</h4>' +
+        '  <span style="font-size: 13px; color: #666;">支持每日固定时间（中午）自动向指定QQ群批量发送最新月薪喵表情包。内置智能防刷屏机制：若自上次发送后群内其他成员发言未达门槛则自动暂缓，直到活跃达标再补发。</span>' +
         '</div>'
       ),
       ctx.NapCatConfig.boolean("enable_schedule", "开启定时发送", true, "是否启用每日固定时间群发月薪喵表情包"),
       ctx.NapCatConfig.text("schedule_groups", "定时发送目标群号", "", "需要定时发送表情包的群号列表，支持多个群号，用逗号、空格或换行分隔（如：123456, 7891011）"),
-      ctx.NapCatConfig.text("schedule_times", "每日定时发送时间点", "09:00, 12:00, 18:00", "24小时制 HH:mm，多个时间用逗号分隔，例如：09:00, 12:00, 18:00"),
-      ctx.NapCatConfig.number("schedule_random_minutes", "随机浮动范围 (分钟)", 0, "设置定时发送在设定时间点前后随机浮动的分钟数，例如填 10 则在设定时间前后 ±10 分钟内随机触发；填 0 为固定时间准点发送"),
+      ctx.NapCatConfig.text("schedule_times", "每日定时发送时间点", "12:30", "24小时制 HH:mm，中午定时发送时间点（例如：12:30）"),
+      ctx.NapCatConfig.number("schedule_random_minutes", "随机浮动范围 (分钟)", 0, "设置定时发送在设定时间点前后随机浮动的分钟数，例如填 60 则在设定时间前后 ±60 分钟内随机触发；填 0 为固定时间准点发送"),
+      ctx.NapCatConfig.boolean("enable_schedule_activity_check", "防死群刷屏活跃度检测", true, "若群内自上次发消息后其他成员发言不足设定条数，则暂缓发送，直到群内发言活跃达到门槛再自动补发，防止被群管理判定为刷屏"),
+      ctx.NapCatConfig.number("schedule_min_other_msgs", "群发言活跃门槛 (条)", 5, "自上次机器人发送后，群内其他成员至少需发送的消息条数（默认5条）"),
       ctx.NapCatConfig.text("schedule_text", "附带文本说明 (可选)", "", "发送表情包时随图附带的文字，留空则纯发表情包"),
       ctx.NapCatConfig.text("schedule_custom_image", "自定义表情图片 (可选)", "", "留空则默认使用内置的最新月薪喵动态表情；可填写本地绝对路径、网络图片URL或 base64://")
     );
@@ -1325,6 +1512,36 @@ export const plugin_onmessage = async (ctx, event) => {
       const protectedCount = protectedGroupList.length;
       const pendingRestoreCount = pendingCardRestores.size;
 
+      // 活跃度防刷屏状态
+      let activitySummary = '';
+      if (currentConfig.enable_schedule_activity_check) {
+        const minMsgs = Math.max(1, Number(currentConfig.schedule_min_other_msgs) || 5);
+        const configuredGroups = (currentConfig.schedule_groups || '')
+          .split(/[,，\s\n]+/)
+          .map(g => g.trim())
+          .filter(g => /^\d+$/.test(g));
+        const todayStr = getTodayDateStr();
+        const actLines = [];
+        for (const gid of configuredGroups) {
+          const act = getGroupActivity(gid);
+          const isTodaySent = act.lastSentDate === todayStr;
+          let label = '';
+          if (isTodaySent) {
+            label = `✅今日已发 (群内后续发言: ${act.otherMsgCount}条)`;
+          } else if (act.waitingForActivity) {
+            label = `⏳暂缓中 (发言 ${act.otherMsgCount}/${minMsgs}条，等待群活跃)`;
+          } else if (act.lastSentTime === 0) {
+            label = `🆕首发待命`;
+          } else if (act.otherMsgCount >= minMsgs) {
+            label = `🟢活跃达标 (${act.otherMsgCount}/${minMsgs}条，待定时发送)`;
+          } else {
+            label = `⚪活跃不足 (${act.otherMsgCount}/${minMsgs}条)`;
+          }
+          actLines.push(`  • 群 [${gid}]: ${label}`);
+        }
+        activitySummary = actLines.length > 0 ? `👥 群活跃度防刷屏 (${minMsgs}条门槛):\n${actLines.join('\n')}\n` : '';
+      }
+
       const statusText =
         `🤖 【消息中转传话插件运行状态】\n` +
         `━━━━━━━━━━━━━━━\n` +
@@ -1346,7 +1563,9 @@ export const plugin_onmessage = async (ctx, event) => {
         `⏰ 定时月薪喵: ${currentConfig.enable_schedule ? '✅ 开启' : '❌ 关闭'}\n` +
         `🕒 设定时间点: ${currentConfig.schedule_times || '未设置'}\n` +
         `🎲 随机时间浮动: ${randomDesc}\n` +
+        `🛡️ 防刷屏检测: ${currentConfig.enable_schedule_activity_check ? `✅ 开启 (其他发言满 ${currentConfig.schedule_min_other_msgs || 5} 条触发)` : '❌ 关闭'}\n` +
         `📢 定时目标群聊: ${currentConfig.schedule_groups || '未配置'}\n` +
+        (activitySummary || '') +
         (planList ? `📅 今日执行计划:\n${planList}\n` : '') +
         `📊 活跃引用映射条数: ${messageMap.size} 条 | 好友缓存: ${friendCache.size} 位\n` +
         `━━━━━━━━━━━━━━━\n` +
@@ -1365,9 +1584,12 @@ export const plugin_onmessage = async (ctx, event) => {
         `• 发送 #开启引用回复 / #关闭引用回复\n` +
         `• 发送 #测试月薪喵 [群号] / #月薪喵\n` +
         `• 发送 #设置群聊 <群号1,群号2...>\n` +
-        `• 发送 #设置时间 <09:00,12:00,18:00>\n` +
+        `• 发送 #设置时间 <12:30>\n` +
         `• 发送 #设置随机 <分钟数> (设置时间前后随机浮动)\n` +
         `• 发送 #开启月薪喵 / #关闭月薪喵\n` +
+        `• 发送 #开启防刷 / #关闭防刷 (防死群刷屏检测)\n` +
+        `• 发送 #设置发言门槛 <条数> (如 #设置发言门槛 5)\n` +
+        `• 发送 #重置群活跃 <群号> (重置某群活跃发言计数)\n` +
         `• 发送 #同意 <QQ号> [备注名] / #拒绝 <QQ号>\n` +
         `• 发送 #免打扰 查看免打扰设置与指令`;
 
@@ -1609,6 +1831,66 @@ export const plugin_onmessage = async (ctx, event) => {
         user_id: targetQq,
         message: `⏸️ 已暂停定时群发月薪喵表情包。`
       }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 10.1 快捷指令：开启/关闭防刷屏活跃度检测
+    if (rawText === '#开启防刷' || rawText === '#开启防刷屏' || rawText === '#启用防刷') {
+      currentConfig.enable_schedule_activity_check = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启防死群刷屏活跃度检测！自上次发消息后，群内其他成员发言需达 ${currentConfig.schedule_min_other_msgs || 5} 条才会在中午发送定时消息，若未达标将暂缓直至活跃达标后再补发。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭防刷' || rawText === '#关闭防刷屏' || rawText === '#停用防刷') {
+      currentConfig.enable_schedule_activity_check = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已关闭防死群刷屏活跃度检测，定时时间到达后将对所有目标群直接发送。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 10.2 快捷指令：设置发言门槛 (#设置发言门槛 <条数> / #设置防刷条数 <条数>)
+    const setThresholdMatch = rawText.match(/^#(?:设置发言门槛|设置防刷门槛|设置防刷条数|发言门槛|防刷门槛)\s+(\d+)$/);
+    if (setThresholdMatch) {
+      const count = Math.max(1, parseInt(setThresholdMatch[1], 10));
+      currentConfig.schedule_min_other_msgs = count;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已将群发言活跃门槛设置为: ${count} 条！自上次机器人发消息后，群内其他成员发言满 ${count} 条才会触发下一次定时发送。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 10.3 快捷指令：重置群活跃度计数 (#重置群活跃 [群号])
+    const resetActMatch = rawText.match(/^#(?:重置群活跃|重置活跃|清理活跃)(?:\s+(\d+))?$/);
+    if (resetActMatch) {
+      const specifiedGid = resetActMatch[1]?.trim();
+      if (specifiedGid) {
+        const act = getGroupActivity(specifiedGid);
+        act.otherMsgCount = 0;
+        act.waitingForActivity = false;
+        saveGroupActivity();
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `✅ 已重置群 [${specifiedGid}] 的其他成员发言计数为 0 条。`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      } else {
+        for (const act of groupActivityMap.values()) {
+          act.otherMsgCount = 0;
+          act.waitingForActivity = false;
+        }
+        saveGroupActivity();
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `✅ 已重置所有群的其他成员发言计数为 0 条。`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      }
       return;
     }
 
@@ -2245,6 +2527,11 @@ export const plugin_onmessage = async (ctx, event) => {
 
   // 处理群聊转发与 @ 提醒
   if (event.message_type === 'group') {
+    // 0. 群活跃度统计与防刷屏自动补发检测（排除机器人自身消息）
+    if (senderId !== selfUin) {
+      await handleGroupActivityOnMessage(ctx, event);
+    }
+
     // 检查是否有人 @ 机器人
     const isAtMe = (Array.isArray(event.message) && event.message.some(
       seg => seg.type === 'at' && String(seg.data?.qq) === selfUin
@@ -2417,6 +2704,11 @@ export const plugin_cleanup = async () => {
   if (saveTimer) {
     clearInterval(saveTimer);
     saveTimer = null;
+  }
+  if (groupActivitySaveTimer) {
+    clearTimeout(groupActivitySaveTimer);
+    groupActivitySaveTimer = null;
+    saveGroupActivity();
   }
   for (const [gid, pending] of pendingCardRestores.entries()) {
     if (pending?.timer) {
