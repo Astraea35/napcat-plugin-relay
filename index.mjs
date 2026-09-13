@@ -26,6 +26,10 @@ let currentConfig = {
   forward_friend_request: true,    // 转发好友申请给管理员
   auto_approve_friend: false,      // 是否自动同意好友申请
   auto_approve_keyword: "",        // 附言包含关键字时自动同意（留空不启用）
+  notify_on_at: true,              // 群聊有人@机器人时是否通知管理员
+  auto_protect_group_card: true,   // 是否开启群名片防篡改自动恢复
+  protect_card_delay_minutes: 10,  // 检测到群名片被改后，延迟多少分钟改回（防抢拉扯）
+  default_group_card: "A 接三角洲护航 代网课", // 默认期望群名片
   // 定时群发月薪喵表情包配置
   enable_schedule: true,           // 是否开启定时群发
   schedule_groups: "",             // 目标群聊列表（支持逗号/空格/换行分隔，如：123456, 7891011）
@@ -42,6 +46,13 @@ const messageMap = new Map();
 const MAX_MAP_SIZE = 5000;
 let saveTimer = null;
 let dataDir = '';
+
+// 受保护群的期望名片映射: groupId -> expectedCard
+const protectedGroupCards = new Map();
+
+// 待执行的名片改回任务: groupId -> { timer, expectedCard, oldCard, newCard, detectedAt, scheduledAt, groupName }
+const pendingCardRestores = new Map();
+let cardPollCounter = 0;
 
 // 待处理的好友申请缓存: key -> { user_id, nickname, flag, comment, time }
 // 这里的 key 可以是 message_id (发给管理员的消息ID)、user_id (申请人QQ)、flag
@@ -224,6 +235,295 @@ function recordMessageMapping(sentId, info) {
   }
   messageMap.set(key, info);
   scheduleSaveMessageMap();
+}
+
+/**
+ * 获取机器人自身的 QQ 号
+ */
+async function getSelfUin(ctx) {
+  if (ctx.core?.selfInfo?.uin) return String(ctx.core.selfInfo.uin).trim();
+  try {
+    const loginInfo = await ctx.actions.call('get_login_info', {}, ctx.adapterName, ctx.pluginManager?.config);
+    if (loginInfo?.user_id) return String(loginInfo.user_id).trim();
+  } catch (e) {}
+  return '';
+}
+
+/**
+ * 获取所有受保护的群号列表（去重）
+ */
+function getProtectedGroupIds() {
+  const set = new Set();
+  const raw = currentConfig.schedule_groups || '';
+  for (const part of raw.split(/[,，\s\n]+/)) {
+    const trimmed = part.trim();
+    if (/^\d+$/.test(trimmed)) {
+      set.add(trimmed);
+    }
+  }
+  for (const gid of protectedGroupCards.keys()) {
+    if (/^\d+$/.test(gid)) {
+      set.add(gid);
+    }
+  }
+  return Array.from(set);
+}
+
+/**
+ * 从磁盘加载受保护群名片配置
+ */
+function loadProtectedCards() {
+  try {
+    if (!dataDir) return;
+    const cardsFile = path.join(dataDir, 'protected_group_cards.json');
+    if (fs.existsSync(cardsFile)) {
+      const data = JSON.parse(fs.readFileSync(cardsFile, 'utf-8'));
+      if (typeof data === 'object' && data !== null) {
+        protectedGroupCards.clear();
+        for (const [gid, card] of Object.entries(data)) {
+          if (gid && typeof card === 'string') {
+            protectedGroupCards.set(String(gid).trim(), card.trim());
+          }
+        }
+        logger?.info(`[Relay Card] 成功从磁盘加载 ${protectedGroupCards.size} 个群的名片保护配置`);
+      }
+    }
+  } catch (err) {
+    logger?.warn('[Relay Card] 读取群名片保护文件失败:', err);
+  }
+}
+
+/**
+ * 保存受保护群名片配置到磁盘
+ */
+function saveProtectedCards() {
+  try {
+    if (!dataDir) return;
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    const cardsFile = path.join(dataDir, 'protected_group_cards.json');
+    const obj = {};
+    for (const [gid, card] of protectedGroupCards.entries()) {
+      obj[gid] = card;
+    }
+    fs.writeFileSync(cardsFile, JSON.stringify(obj, null, 2), 'utf-8');
+    logger?.debug?.(`[Relay Card] 群名片保护配置已保存: ${protectedGroupCards.size} 个群`);
+  } catch (err) {
+    logger?.warn('[Relay Card] 保存群名片保护配置失败:', err);
+  }
+}
+
+/**
+ * 执行群名片恢复改回
+ */
+async function executeCardRestore(ctx, groupId, isManual = false) {
+  const gId = String(groupId || '').trim();
+  const pending = pendingCardRestores.get(gId);
+  if (pending?.timer) {
+    clearTimeout(pending.timer);
+  }
+  pendingCardRestores.delete(gId);
+
+  const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
+  if (!expectedCard) return { success: false, message: '未找到期望名片配置' };
+
+  const targetQq = String(currentConfig.target_qq || '').trim();
+  const selfUin = await getSelfUin(ctx);
+  if (!selfUin) return { success: false, message: '无法获取机器人自身QQ号' };
+
+  try {
+    await ctx.actions.call('set_group_card', {
+      group_id: Number(gId),
+      user_id: Number(selfUin),
+      card: expectedCard
+    }, ctx.adapterName, ctx.pluginManager.config);
+
+    logger?.info(`[Relay Card] ✅ 成功将群 [${gId}] 的群名片改回: "${expectedCard}" (${isManual ? '手动执行' : '自动恢复'})`);
+
+    if (targetQq) {
+      const tip = isManual
+        ? `✅ 【群名片手动改回成功】\n━━━━━━━━━━━━━━━\n👥 目标群聊: ${pending?.groupName || gId} (${gId})\n🏷️ 名片已立即恢复为: ${expectedCard}`
+        : `✅ 【群名片自动恢复成功】\n━━━━━━━━━━━━━━━\n👥 目标群聊: ${pending?.groupName || gId} (${gId})\n🏷️ 已度过防抢保护期，名片已自动恢复为: ${expectedCard}`;
+
+      try {
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: tip
+        }, ctx.adapterName, ctx.pluginManager.config);
+      } catch (e) {}
+    }
+    return { success: true, message: '成功' };
+  } catch (err) {
+    logger?.error(`[Relay Card] ❌ 改回群 [${gId}] 群名片失败:`, err);
+    if (targetQq) {
+      try {
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `❌ 【群名片改回失败】\n━━━━━━━━━━━━━━━\n👥 目标群聊: ${pending?.groupName || gId} (${gId})\n⚠️ 尝试改回「${expectedCard}」失败: ${err?.message || err}`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      } catch (e) {}
+    }
+    return { success: false, message: err?.message || String(err) };
+  }
+}
+
+/**
+ * 检查名片并调度延迟改回任务
+ */
+async function checkAndScheduleCardRestore(ctx, groupId, currentCard, groupName = '') {
+  if (!currentConfig.auto_protect_group_card) return;
+  const gId = String(groupId || '').trim();
+  if (!gId) return;
+
+  const protectedIds = getProtectedGroupIds();
+  if (!protectedIds.includes(gId)) return;
+
+  const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
+  if (!expectedCard) return;
+
+  const cleanCurrentCard = (currentCard || '').trim();
+
+  // 若当前名片已与期望名片一致，若有待执行任务则取消
+  if (cleanCurrentCard === expectedCard) {
+    if (pendingCardRestores.has(gId)) {
+      const pending = pendingCardRestores.get(gId);
+      if (pending?.timer) clearTimeout(pending.timer);
+      pendingCardRestores.delete(gId);
+      logger?.info(`[Relay Card] 群 [${gId}] 名片已恢复为期望名片 "${expectedCard}"，已自动取消待执行改回任务`);
+    }
+    return;
+  }
+
+  // 检测到不一致，排队延迟改回
+  const delayMinutes = Math.max(1, Number(currentConfig.protect_card_delay_minutes) || 10);
+  const now = Date.now();
+  const scheduledAt = now + delayMinutes * 60 * 1000;
+  const targetQq = String(currentConfig.target_qq || '').trim();
+
+  // 若该群已有排队任务，仅更新其被修改的名片记录，保持既有倒计时不重复发通知
+  if (pendingCardRestores.has(gId)) {
+    const existing = pendingCardRestores.get(gId);
+    existing.newCard = cleanCurrentCard;
+    if (groupName && !existing.groupName) existing.groupName = groupName;
+    return;
+  }
+
+  const dateObj = new Date(scheduledAt);
+  const targetTimeStr = `${String(dateObj.getHours()).padStart(2, '0')}:${String(dateObj.getMinutes()).padStart(2, '0')}:${String(dateObj.getSeconds()).padStart(2, '0')}`;
+
+  const restoreTask = {
+    expectedCard,
+    oldCard: expectedCard,
+    newCard: cleanCurrentCard,
+    detectedAt: now,
+    scheduledAt,
+    groupName: groupName || gId,
+    timer: null
+  };
+
+  restoreTask.timer = setTimeout(async () => {
+    await executeCardRestore(ctx, gId, false);
+  }, delayMinutes * 60 * 1000);
+
+  pendingCardRestores.set(gId, restoreTask);
+
+  logger?.warn(`[Relay Card] ⚠️ 检测到群 [${gId}] 名片被修改为: "${cleanCurrentCard}" (期望: "${expectedCard}")。已排队将在 ${delayMinutes} 分钟后 (${targetTimeStr}) 自动改回`);
+
+  if (targetQq) {
+    const alertMsg =
+      `⚠️ 【群名片被修改警告】\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `👥 目标群聊: ${groupName || gId} (${gId})\n` +
+      `🏷️ 原设定名片: ${expectedCard}\n` +
+      `❌ 被修改为: ${cleanCurrentCard ? cleanCurrentCard : '【被清空/默认昵称】'}\n` +
+      `⏳ 防抢冲突保护已启动：将在 ${delayMinutes} 分钟后（预计 ${targetTimeStr}）自动改回。\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `💡 快捷指令：\n` +
+      `• 发送「#立即改名片 ${gId}」立即改回\n` +
+      `• 发送「#取消改名片 ${gId}」取消本次自动改回\n` +
+      `• 发送「#设置群名片 ${gId} <新名片>」修改期望名片`;
+
+    try {
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: alertMsg
+      }, ctx.adapterName, ctx.pluginManager.config);
+    } catch (e) {
+      logger?.error('[Relay Card] 发送群名片被篡改警告失败:', e);
+    }
+  }
+}
+
+/**
+ * 轮询检查所有受保护群名片（安全兜底）
+ */
+async function pollCheckProtectedGroupCards(ctx) {
+  if (!currentConfig.auto_protect_group_card) return;
+  const selfUin = await getSelfUin(ctx);
+  if (!selfUin) return;
+
+  const groupIds = getProtectedGroupIds();
+  for (const gId of groupIds) {
+    if (pendingCardRestores.has(gId)) continue;
+    try {
+      const info = await ctx.actions.call('get_group_member_info', {
+        group_id: Number(gId),
+        user_id: Number(selfUin),
+        no_cache: true
+      }, ctx.adapterName, ctx.pluginManager?.config);
+      if (info && (info.card !== undefined || info.nickname !== undefined)) {
+        const currentCard = (info.card || '').trim();
+        const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
+        if (expectedCard && currentCard !== expectedCard) {
+          await checkAndScheduleCardRestore(ctx, gId, currentCard);
+        }
+      }
+    } catch (e) {
+      // 群可能不存在或已被踢出
+    }
+  }
+}
+
+/**
+ * 初始化群名片保护基线
+ */
+async function initProtectedGroupCards(ctx) {
+  loadProtectedCards();
+  const selfUin = await getSelfUin(ctx);
+  if (!selfUin) return;
+
+  const groupIds = getProtectedGroupIds();
+  let updated = false;
+  for (const gid of groupIds) {
+    if (!protectedGroupCards.has(gid)) {
+      try {
+        const info = await ctx.actions.call('get_group_member_info', {
+          group_id: Number(gid),
+          user_id: Number(selfUin),
+          no_cache: true
+        }, ctx.adapterName, ctx.pluginManager?.config);
+        const card = (info?.card || '').trim();
+        if (card) {
+          protectedGroupCards.set(gid, card);
+          updated = true;
+          logger?.info(`[Relay Card] 自动识别并建立群 [${gid}] 名片防篡改基线: "${card}"`);
+        } else if (currentConfig.default_group_card) {
+          protectedGroupCards.set(gid, currentConfig.default_group_card.trim());
+          updated = true;
+          logger?.info(`[Relay Card] 群 [${gid}] 当前名片为空，设定为默认名片: "${currentConfig.default_group_card.trim()}"`);
+        }
+      } catch (e) {
+        logger?.debug?.(`[Relay Card] 检查群 [${gid}] 成员名片失败:`, e?.message || e);
+      }
+    }
+  }
+  if (updated) {
+    saveProtectedCards();
+  }
+
+  // 初始检查一次所有受保护群名片
+  await pollCheckProtectedGroupCards(ctx);
 }
 
 /**
@@ -559,7 +859,8 @@ async function isChatDND(ctx, event) {
 
 let catImageBase64Cache = null;
 let scheduleTimer = null;
-// 今日随机调度计划: slot ("09:00") -> { slot, targetTimestamp, targetTimeStr, triggered: boolean, offsetMinutes: string }
+const schedulerStateKey = Symbol.for('napcat-plugin-relay.scheduler');
+// 今日随机调度计划: slot ("09:00") -> { slot, targetTimestamp, targetTimeStr, state, offsetMinutes: string }
 const dailySchedulePlan = new Map();
 let currentPlanDate = '';
 
@@ -594,8 +895,8 @@ function generateDailySchedulePlan(now = new Date(), force = false) {
 
   for (const slot of configuredTimes) {
     const existing = dailySchedulePlan.get(slot);
-    // 如果今天该时段已经触发过且不是强制重算，保留
-    if (existing && existing.triggered && !force && !isNewDay) {
+    // 已发送、已跳过或发送失败的时段不应被后续重算再次安排。
+    if (existing && existing.state !== 'pending' && !isNewDay) {
       continue;
     }
     // 如果已有未触发的计划且不是强制重算，保留
@@ -619,15 +920,17 @@ function generateDailySchedulePlan(now = new Date(), force = false) {
     const targetS = String(targetDate.getSeconds()).padStart(2, '0');
     const targetTimeStr = `${targetH}:${targetM}:${targetS}`;
 
-    // 如果计算出的计划时间已经过去超过60秒且并非强制更新，判定为已过时
+    // 超过一分钟的计划已过时；即使强制重算，也不能因此补发旧时段。
     const isPast = targetDate.getTime() < now.getTime() - 60000;
 
     dailySchedulePlan.set(slot, {
       slot,
       targetTimestamp: targetDate.getTime(),
       targetTimeStr,
-      triggered: isPast && !force ? true : (existing?.triggered || false),
-      offsetMinutes: (offsetSeconds / 60).toFixed(1)
+      state: isPast ? 'skipped' : (existing?.state === 'sent' ? 'sent' : 'pending'),
+      offsetMinutes: (offsetSeconds / 60).toFixed(1),
+      sentAt: existing?.sentAt || null,
+      result: existing?.result || null
     });
   }
 
@@ -639,7 +942,7 @@ function generateDailySchedulePlan(now = new Date(), force = false) {
   }
 
   const planSummary = Array.from(dailySchedulePlan.entries())
-    .map(([k, v]) => `${k} -> 预计 ${v.targetTimeStr} (${v.triggered ? '已触发' : '待触发'})`)
+    .map(([k, v]) => `${k} -> 预计 ${v.targetTimeStr} (${v.state === 'sent' ? '已发送' : v.state === 'skipped' ? '已跳过' : v.state === 'failed' ? '发送失败' : '待发送'})`)
     .join('; ');
   logger?.info?.(`[Relay Schedule] 今日定时发送执行计划已就绪 (${currentDateStr}): ${planSummary || '无有效配置'}`);
 }
@@ -735,10 +1038,19 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
  * 启动定时调度轮询器
  */
 function startScheduler(ctx) {
+  // 热更新时模块可能重新加载；用全局句柄清理上一实例，避免旧版整点计时器残留。
+  const previousScheduler = globalThis[schedulerStateKey];
+  if (previousScheduler?.timer) {
+    clearInterval(previousScheduler.timer);
+  }
+
   if (scheduleTimer) {
     clearInterval(scheduleTimer);
     scheduleTimer = null;
   }
+
+  const schedulerState = { timer: null };
+  globalThis[schedulerStateKey] = schedulerState;
 
   // 启动时初次生成今日计划
   generateDailySchedulePlan(new Date());
@@ -756,18 +1068,28 @@ function startScheduler(ctx) {
       }
 
       for (const [slot, plan] of dailySchedulePlan.entries()) {
-        if (!plan.triggered && now.getTime() >= plan.targetTimestamp) {
-          plan.triggered = true;
+        if (plan.state === 'pending' && now.getTime() >= plan.targetTimestamp) {
+          plan.state = 'sending';
           const randomInfo = Number(currentConfig.schedule_random_minutes) > 0 ? ` (随机浮动: ${plan.offsetMinutes}分)` : '';
           logger?.info(`[Relay Schedule] ⏰ 到达计划发送时间: ${plan.targetTimeStr} [设定时段: ${slot}${randomInfo}]，开始执行群聊广播...`);
 
-          await sendCatToConfiguredGroups(ctx, `定时任务(${slot} 实际:${plan.targetTimeStr})`);
+          const result = await sendCatToConfiguredGroups(ctx, `定时任务(${slot} 实际:${plan.targetTimeStr})`);
+          plan.state = result.success ? 'sent' : 'failed';
+          plan.sentAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+          plan.result = result;
         }
+      }
+
+      // 每 2 分钟 (8 次轮询) 检查一次受保护群的名片状态 (安全兜底)
+      cardPollCounter++;
+      if (cardPollCounter % 8 === 0) {
+        await pollCheckProtectedGroupCards(ctx);
       }
     } catch (err) {
       logger?.error('[Relay Schedule] 定时任务轮询执行异常:', err);
     }
   }, 15000); // 15秒高频轮询保证秒级准时
+  schedulerState.timer = scheduleTimer;
 
   logger?.info('[Relay Schedule] 定时调度引擎已启动 (轮询周期: 15秒，支持时间点前后随机浮动)');
 }
@@ -805,7 +1127,10 @@ export const plugin_init = async (ctx) => {
   // 4. 预加载好友列表与备注缓存
   refreshFriendCache(ctx).catch(err => logger?.debug?.('[Relay] 预加载好友缓存失败:', err));
 
-  // 5. 构建 WebUI 配置界面
+  // 5. 初始化群名片防篡改保护基线与任务
+  initProtectedGroupCards(ctx).catch(err => logger?.error?.('[Relay Card] 初始化群名片保护异常:', err));
+
+  // 6. 构建 WebUI 配置界面
   if (ctx.NapCatConfig) {
     plugin_config_ui = ctx.NapCatConfig.combine(
       ctx.NapCatConfig.html('<div style="padding: 12px; background: rgba(0,0,0,0.04); border-radius: 8px; margin-bottom: 10px;">' +
@@ -814,7 +1139,8 @@ export const plugin_init = async (ctx) => {
         '</div>'),
       ctx.NapCatConfig.text("target_qq", "目标管理员 QQ", "", "接收所有转发消息与好友申请的目标好友QQ号"),
       ctx.NapCatConfig.boolean("forward_private", "转发私聊消息", true, "开启后，所有好友和陌生人发给机器人的私聊消息均会转发给管理员"),
-      ctx.NapCatConfig.boolean("forward_group", "转发群聊消息", false, "是否转发群聊消息给管理员（建议谨慎开启，避免群消息过多）"),
+      ctx.NapCatConfig.boolean("notify_on_at", "群聊有人@我时通知", true, "即使未开启全部群聊转发，当群内有人@机器人时也会将消息通知转发给管理员"),
+      ctx.NapCatConfig.boolean("forward_group", "转发全部群聊消息", false, "是否转发群聊消息给管理员（建议谨慎开启，避免群消息过多）"),
       ctx.NapCatConfig.boolean("forward_group_at_only", "群聊仅转发@我的消息", true, "当开启群聊转发时，仅转发艾特机器人的群消息"),
       ctx.NapCatConfig.boolean("forward_file", "转发文件消息", true, "收到私聊/群聊文件时，自动向管理员转发 QQ 原生文件卡片并推送文件详情与下载直链"),
       ctx.NapCatConfig.boolean("enable_quote_reply", "回复对方时使用引用回复", true, "管理员引用回复中转消息时，机器人向原好友发送消息是否【引用回复】对方最初发送的那条消息"),
@@ -826,6 +1152,16 @@ export const plugin_init = async (ctx) => {
       ctx.NapCatConfig.text("dnd_list_str", "手动免打扰名单 (QQ/群号)", "", "额外的免打扰名单，多个QQ号或群号可用逗号、空格或换行分隔，设置后这些会话的消息不会被转发"),
       ctx.NapCatConfig.boolean("show_sender_info", "显示发送者信息前缀", true, "转发消息时附加 [来自私聊: 备注名(QQ)] 标识"),
       ctx.NapCatConfig.boolean("send_confirmation", "发送回复成功回执", true, "管理员引用回复成功转回后，是否向管理员发送成功提示"),
+      // 群名片防篡改保护配置
+      ctx.NapCatConfig.html(
+        '<div style="margin: 15px 0 10px; padding: 12px; background: rgba(103, 194, 58, 0.08); border-left: 4px solid #67c23a; border-radius: 4px;">' +
+        '  <h4 style="margin: 0 0 5px; color: #67c23a;">🛡️ 群名片防篡改自动恢复</h4>' +
+        '  <span style="font-size: 13px; color: #666;">自动检测发消息群聊的名片是否被管理员修改，若被修改则延迟10分钟自动改回，避免与群管理互相抢改冲突。</span>' +
+        '</div>'
+      ),
+      ctx.NapCatConfig.boolean("auto_protect_group_card", "开启群名片防篡改保护", true, "检测到发消息群聊的群名片被篡改后，自动排队改回"),
+      ctx.NapCatConfig.number("protect_card_delay_minutes", "防篡改改回延迟 (分钟)", 10, "检测到群名片被修改后，延迟多少分钟再改回（默认10分钟）"),
+      ctx.NapCatConfig.text("default_group_card", "默认期望群名片", "A 接三角洲护航 代网课", "受保护群聊的名片基线，未单独设置名片的群将自动使用该名片"),
       // 定时发送月薪喵表情包配置
       ctx.NapCatConfig.html(
         '<div style="margin: 15px 0 10px; padding: 12px; background: rgba(64, 158, 255, 0.08); border-left: 4px solid #409eff; border-radius: 4px;">' +
@@ -842,18 +1178,29 @@ export const plugin_init = async (ctx) => {
     );
   }
 
-  logger.info(`[Relay] 插件初始化完成！目标管理员: ${currentConfig.target_qq || '(未配置)'}，免打扰过滤: ${currentConfig.ignore_dnd ? '开' : '关'}，好友申请转发: ${currentConfig.forward_friend_request ? '开' : '关'}，定时月薪喵: ${currentConfig.enable_schedule ? '开' : '关'}`);
+  logger.info(`[Relay] 插件初始化完成！目标管理员: ${currentConfig.target_qq || '(未配置)'}，免打扰过滤: ${currentConfig.ignore_dnd ? '开' : '关'}，群名片防篡改: ${currentConfig.auto_protect_group_card ? '开' : '关'}，群聊@通知: ${currentConfig.notify_on_at ? '开' : '关'}`);
 };
 
 /**
- * 通用事件监听 (捕获好友申请 request 事件等)
+ * 通用事件监听 (捕获好友申请 request 事件、群名片变动 notice 事件等)
  */
 export const plugin_onevent = async (ctx, event) => {
   if (!event) return;
 
-  // 捕获好友申请事件 (OneBot 11 request.friend)
+  // 1. 捕获好友申请事件 (OneBot 11 request.friend)
   if (event.post_type === 'request' && event.request_type === 'friend') {
     await handleFriendRequestEvent(ctx, event);
+  }
+
+  // 2. 捕获群名片变动通知 (OneBot 11 notice.group_card)
+  if (event.post_type === 'notice' && event.notice_type === 'group_card') {
+    const selfUin = await getSelfUin(ctx);
+    if (selfUin && String(event.user_id) === String(selfUin)) {
+      const groupId = String(event.group_id);
+      const newCard = (event.card_new || '').trim();
+      logger?.info(`[Relay Card Event] 收到群名片变更通知: 群 [${groupId}], 新名片: "${newCard}", 旧名片: "${event.card_old || ''}"`);
+      await checkAndScheduleCardRestore(ctx, groupId, newCard);
+    }
   }
 };
 
@@ -883,17 +1230,34 @@ export const plugin_onmessage = async (ctx, event) => {
       const randomMins = Number(currentConfig.schedule_random_minutes) || 0;
       const randomDesc = randomMins > 0 ? `前后随机 ±${randomMins} 分钟` : '准点发送 (未开启随机)';
       const planList = Array.from(dailySchedulePlan.entries())
-        .map(([slot, p]) => `  • ${slot} 档 ➔ 今日计划 ${p.targetTimeStr} (${p.triggered ? '✅已触发' : '⏳待触发'})`)
+        .map(([slot, p]) => {
+          const stateText = p.state === 'sent'
+            ? `✅已发送 ${p.sentAt || ''}`.trim()
+            : p.state === 'skipped'
+              ? '⏭️已跳过（插件启动时该时段已过）'
+            : p.state === 'failed'
+              ? '❌发送失败'
+                : p.state === 'sending'
+                  ? '📤发送中'
+                  : '⏳待发送';
+          return `  • ${slot} 档 ➔ 今日计划 ${p.targetTimeStr} (${stateText})`;
+        })
         .join('\n');
+
+      const protectedCount = getProtectedGroupIds().length;
+      const pendingRestoreCount = pendingCardRestores.size;
 
       const statusText =
         `🤖 【消息中转传话插件运行状态】\n` +
         `━━━━━━━━━━━━━━━\n` +
         `📌 管理员账号: ${targetQq}\n` +
         `📥 私聊转发: ${currentConfig.forward_private ? '✅ 开启' : '❌ 关闭'}\n` +
+        `🔔 群聊@提醒: ${currentConfig.notify_on_at ? '✅ 开启 (群内有人@机器人时推送)' : '❌ 关闭'}\n` +
         `👥 群聊转发: ${currentConfig.forward_group ? '✅ 开启' : '❌ 关闭'}\n` +
         `🎯 群聊仅@: ${currentConfig.forward_group_at_only ? '✅ 开启' : '❌ 关闭'}\n` +
         `📁 文件转发: ${currentConfig.forward_file ? '✅ 开启' : '❌ 关闭'}\n` +
+        `🛡️ 群名片防篡改: ${currentConfig.auto_protect_group_card ? `✅ 开启 (延迟 ${currentConfig.protect_card_delay_minutes || 10} 分钟改回)` : '❌ 关闭'}\n` +
+        `🏷️ 期望群名片: 「${currentConfig.default_group_card || '未设置'}」 (已保护 ${protectedCount} 个群${pendingRestoreCount > 0 ? `，${pendingRestoreCount} 个待改回` : ''})\n` +
         `🏷️ 备注名优先: ✅ 开启 (原昵称追加: ${currentConfig.show_original_nickname ? '开启' : '关闭'})\n` +
         `💬 引用回复原消息: ${currentConfig.enable_quote_reply ? '✅ 开启' : '❌ 关闭'}\n` +
         `🤝 好友申请推送: ${currentConfig.forward_friend_request ? '✅ 开启' : '❌ 关闭'}\n` +
@@ -909,8 +1273,15 @@ export const plugin_onmessage = async (ctx, event) => {
         `📊 活跃引用映射条数: ${messageMap.size} 条 | 好友缓存: ${friendCache.size} 位\n` +
         `━━━━━━━━━━━━━━━\n` +
         `💡 快捷管理指令:\n` +
-        `• 【引用回复】消息：自动原路回复该好友/群聊\n` +
+        `• 【引用回复】消息：自动原路回复该好友/群聊 (群聊@通知同理)\n` +
         `• 【引用回复】好友申请：回复「同意」或「拒绝」处理申请\n` +
+        `• 发送 #开启@通知 / #关闭@通知\n` +
+        `• 发送 #群名片 查看防篡改状态与倒计时\n` +
+        `• 发送 #设置群名片 [群号] <名片> (设置期望名片)\n` +
+        `• 发送 #立即改名片 [群号] (跳过等待立即改回)\n` +
+        `• 发送 #取消改名片 [群号] (取消待恢复任务)\n` +
+        `• 发送 #设置改名延迟 <分钟数> (如 #设置改名延迟 10)\n` +
+        `• 发送 #开启防改名片 / #关闭防改名片\n` +
         `• 发送 #刷新好友 (立即同步最新QQ好友备注)\n` +
         `• 发送 #开启原名 / #关闭原名 (切换是否显示原昵称)\n` +
         `• 发送 #开启引用回复 / #关闭引用回复\n` +
@@ -1105,7 +1476,7 @@ export const plugin_onmessage = async (ctx, event) => {
       saveConfigToFile();
       generateDailySchedulePlan(new Date(), true);
       const planDesc = Array.from(dailySchedulePlan.entries())
-        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.triggered ? '✅已执行' : '⏳待执行'})`)
+        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.state === 'sent' ? '✅已发送' : p.state === 'skipped' ? '⏭️已跳过' : '⏳待发送'})`)
         .join('\n');
       await ctx.actions.call('send_private_msg', {
         user_id: targetQq,
@@ -1131,7 +1502,7 @@ export const plugin_onmessage = async (ctx, event) => {
       saveConfigToFile();
       generateDailySchedulePlan(new Date(), true);
       const planDesc = Array.from(dailySchedulePlan.entries())
-        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.triggered ? '✅已执行' : '⏳待执行'})`)
+        .map(([slot, p]) => `• ${slot} 时段 ➔ 今日预计 ${p.targetTimeStr} (${p.state === 'sent' ? '✅已发送' : p.state === 'skipped' ? '⏭️已跳过' : '⏳待发送'})`)
         .join('\n');
       const tip = minutes > 0
         ? `✅ 已设置定时发送前后随机浮动时长为: ±${minutes} 分钟！\n每次发送将在设定时间点的前后 ${minutes} 分钟内随机触发。\n\n📅 今日更新后的执行计划：\n${planDesc || '(未设置发送时间点)'}`
@@ -1233,7 +1604,224 @@ export const plugin_onmessage = async (ctx, event) => {
       return;
     }
 
-    // 15. 检测引用回复
+    // 15. 快捷指令：开启/关闭群聊@提醒 (#开启@通知 / #关闭@通知 / #开启艾特通知 / #关闭艾特通知)
+    if (rawText === '#开启@通知' || rawText === '#开启艾特通知' || rawText === '#开启at通知') {
+      currentConfig.notify_on_at = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启群聊 @ 提醒功能！当群聊有人艾特机器人时，系统将自动向你转发通知，你可以直接引用回复传话。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭@通知' || rawText === '#关闭艾特通知' || rawText === '#关闭at通知') {
+      currentConfig.notify_on_at = false;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已关闭群聊 @ 提醒功能。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 16. 快捷指令：查看群名片保护状态 (#群名片 / #名片状态 / #查看群名片)
+    if (rawText === '#群名片' || rawText === '#名片状态' || rawText === '#查看群名片') {
+      const protectedIds = getProtectedGroupIds();
+      const delayMinutes = Math.max(1, Number(currentConfig.protect_card_delay_minutes) || 10);
+      let descList = [];
+      const now = Date.now();
+
+      for (const gid of protectedIds) {
+        const expected = protectedGroupCards.get(gid) || currentConfig.default_group_card || '未设置';
+        let pendingText = '✅ 正常 (名片未被修改)';
+        if (pendingCardRestores.has(gid)) {
+          const p = pendingCardRestores.get(gid);
+          const remainSec = Math.max(0, Math.round((p.scheduledAt - now) / 1000));
+          const remainMin = Math.floor(remainSec / 60);
+          const remainSecMod = remainSec % 60;
+          pendingText = `⏳ 待改回 (剩余 ${remainMin}分${remainSecMod}秒，当前被改为「${p.newCard || '空'}」)`;
+        }
+        descList.push(`• 群 [${gid}]:\n   期望名片: 「${expected}」\n   当前状态: ${pendingText}`);
+      }
+
+      const statusMsg =
+        `🛡️ 【群名片防篡改保护状态】\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        `📌 功能状态: ${currentConfig.auto_protect_group_card ? '✅ 开启中' : '❌ 已关闭'}\n` +
+        `⏱️ 延迟改回时长: ${delayMinutes} 分钟 (防抢拉扯保护期)\n` +
+        `🏷️ 全局默认名片: 「${currentConfig.default_group_card || '未设置'}」\n` +
+        `👥 受保护群聊数: ${protectedIds.length} 个\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        (descList.length > 0 ? descList.join('\n\n') + '\n━━━━━━━━━━━━━━━\n' : '') +
+        `💡 常用指令：\n` +
+        `• #设置群名片 <名片> (设置全局默认期望名片)\n` +
+        `• #设置群名片 <群号> <名片> (设置指定群期望名片)\n` +
+        `• #立即改名片 [群号] (跳过等待，立即恢复名片)\n` +
+        `• #取消改名片 [群号] (取消当前等待中的恢复任务)\n` +
+        `• #设置改名延迟 <分钟数> (如 #设置改名延迟 10)\n` +
+        `• #开启防改名片 / #关闭防改名片`;
+
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: statusMsg
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 17. 快捷指令：设置群名片 (#设置群名片 [群号] <名片>)
+    const setCardMatch = rawText.match(/^#(?:设置群名片|配置群名片|修改期望名片)(?:\s+(\d+))?\s+(.+)$/);
+    if (setCardMatch) {
+      const specifiedGid = setCardMatch[1]?.trim();
+      const cardContent = setCardMatch[2]?.trim();
+      if (!cardContent) {
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `⚠️ 名片内容不能为空。用法：\n• #设置群名片 A 接三角洲护航 代网课 (设置全局默认名片)\n• #设置群名片 1021782231 A代网课 (设置指定群名片)`
+        }, ctx.adapterName, ctx.pluginManager.config);
+        return;
+      }
+      if (specifiedGid) {
+        protectedGroupCards.set(specifiedGid, cardContent);
+        saveProtectedCards();
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `✅ 已成功为群 [${specifiedGid}] 设置期望群名片为：「${cardContent}」！`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      } else {
+        currentConfig.default_group_card = cardContent;
+        for (const gid of getProtectedGroupIds()) {
+          protectedGroupCards.set(gid, cardContent);
+        }
+        saveConfigToFile();
+        saveProtectedCards();
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `✅ 已将所有受保护群的期望群名片统一设置为：「${cardContent}」！`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      }
+      return;
+    }
+
+    // 18. 快捷指令：立即改名片 (#立即改名片 [群号])
+    const restoreCardMatch = rawText.match(/^#(?:立即改名片|立即恢复名片|改回名片)(?:\s+(\d+))?$/);
+    if (restoreCardMatch) {
+      const specifiedGid = restoreCardMatch[1]?.trim();
+      if (specifiedGid) {
+        const res = await executeCardRestore(ctx, specifiedGid, true);
+        if (!res.success) {
+          await ctx.actions.call('send_private_msg', {
+            user_id: targetQq,
+            message: `❌ 执行立即恢复群 [${specifiedGid}] 名片失败: ${res.message}`
+          }, ctx.adapterName, ctx.pluginManager.config);
+        }
+      } else {
+        const pendingKeys = Array.from(pendingCardRestores.keys());
+        if (pendingKeys.length === 0) {
+          const allGids = getProtectedGroupIds();
+          let count = 0;
+          for (const gid of allGids) {
+            const res = await executeCardRestore(ctx, gid, true);
+            if (res.success) count++;
+          }
+          await ctx.actions.call('send_private_msg', {
+            user_id: targetQq,
+            message: `✅ 已执行全量群名片校准恢复 (共处理 ${count}/${allGids.length} 个群聊)。`
+          }, ctx.adapterName, ctx.pluginManager.config);
+        } else {
+          for (const gid of pendingKeys) {
+            await executeCardRestore(ctx, gid, true);
+          }
+        }
+      }
+      return;
+    }
+
+    // 19. 快捷指令：取消改名片 (#取消改名片 [群号])
+    const cancelCardMatch = rawText.match(/^#(?:取消改名片|取消恢复名片)(?:\s+(\d+))?$/);
+    if (cancelCardMatch) {
+      const specifiedGid = cancelCardMatch[1]?.trim();
+      if (specifiedGid) {
+        if (pendingCardRestores.has(specifiedGid)) {
+          const pending = pendingCardRestores.get(specifiedGid);
+          if (pending?.timer) clearTimeout(pending.timer);
+          pendingCardRestores.delete(specifiedGid);
+          await ctx.actions.call('send_private_msg', {
+            user_id: targetQq,
+            message: `✅ 已成功取消群 [${specifiedGid}] 的自动改回名片任务。`
+          }, ctx.adapterName, ctx.pluginManager.config);
+        } else {
+          await ctx.actions.call('send_private_msg', {
+            user_id: targetQq,
+            message: `⚠️ 群 [${specifiedGid}] 当前没有正在等待中的改回任务。`
+          }, ctx.adapterName, ctx.pluginManager.config);
+        }
+      } else {
+        const count = pendingCardRestores.size;
+        for (const [gid, p] of pendingCardRestores.entries()) {
+          if (p?.timer) clearTimeout(p.timer);
+        }
+        pendingCardRestores.clear();
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `✅ 已取消所有等待中的改名片任务 (共 ${count} 个)。`
+        }, ctx.adapterName, ctx.pluginManager.config);
+      }
+      return;
+    }
+
+    // 20. 快捷指令：设置改名延迟 (#设置改名延迟 <分钟数>)
+    const setDelayMatch = rawText.match(/^#(?:设置改名延迟|改名延迟|设置保护延迟)(?:\s+(\d+))?$/);
+    if (setDelayMatch) {
+      const param = setDelayMatch[1]?.trim();
+      if (param === undefined) {
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `⏱️ 当前群名片修改后延迟改回时长为: ${currentConfig.protect_card_delay_minutes || 10} 分钟。\n\n💡 指令用法: #设置改名延迟 10 (设置为延迟 10 分钟后改回)`
+        }, ctx.adapterName, ctx.pluginManager.config);
+        return;
+      }
+      const minutes = parseInt(param, 10);
+      if (minutes < 1 || minutes > 1440) {
+        await ctx.actions.call('send_private_msg', {
+          user_id: targetQq,
+          message: `⚠️ 延迟分钟数必须在 1 到 1440 分钟之间。`
+        }, ctx.adapterName, ctx.pluginManager.config);
+        return;
+      }
+      currentConfig.protect_card_delay_minutes = minutes;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已成功设置群名片修改后延迟 ${minutes} 分钟再改回！有效避免与管理员反复互抢冲突。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 21. 快捷指令：开启/关闭防改名片 (#开启防改名片 / #关闭防改名片)
+    if (rawText === '#开启防改名片' || rawText === '#开启群名片保护') {
+      currentConfig.auto_protect_group_card = true;
+      saveConfigToFile();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `✅ 已开启群名片防篡改保护！当管理员修改群名片后，系统将在 ${currentConfig.protect_card_delay_minutes || 10} 分钟后自动改回。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+    if (rawText === '#关闭防改名片' || rawText === '#关闭群名片保护') {
+      currentConfig.auto_protect_group_card = false;
+      saveConfigToFile();
+      for (const [gid, p] of pendingCardRestores.entries()) {
+        if (p?.timer) clearTimeout(p.timer);
+      }
+      pendingCardRestores.clear();
+      await ctx.actions.call('send_private_msg', {
+        user_id: targetQq,
+        message: `⏸️ 已关闭群名片防篡改保护功能。`
+      }, ctx.adapterName, ctx.pluginManager.config);
+      return;
+    }
+
+    // 22. 检测引用回复
     let repliedMsgId = null;
 
     if (Array.isArray(event.message)) {
@@ -1576,20 +2164,28 @@ export const plugin_onmessage = async (ctx, event) => {
     return;
   }
 
-  // 处理群聊转发
+  // 处理群聊转发与 @ 提醒
   if (event.message_type === 'group') {
-    if (!currentConfig.forward_group) return;
+    // 检查是否有人 @ 机器人
+    const isAtMe = (Array.isArray(event.message) && event.message.some(
+      seg => seg.type === 'at' && String(seg.data?.qq) === selfUin
+    )) || (event.raw_message && event.raw_message.includes(`[CQ:at,qq=${selfUin}]`));
+
+    // 路由判断：
+    // 1. 如果命中 @我：需要开启 notify_on_at 或者是开启了 forward_group
+    // 2. 如果未命中 @我：需要开启 forward_group 且未开启 forward_group_at_only
+    if (isAtMe) {
+      if (!currentConfig.notify_on_at && !currentConfig.forward_group) {
+        return;
+      }
+    } else {
+      if (!currentConfig.forward_group) return;
+      if (currentConfig.forward_group_at_only) return;
+    }
 
     // 免打扰检查：设置了免打扰/接收不提醒/屏蔽的群聊会话框不予转发
     if (await isChatDND(ctx, event)) {
       return;
-    }
-
-    if (currentConfig.forward_group_at_only) {
-      const isAtMe = Array.isArray(event.message) && event.message.some(
-        seg => seg.type === 'at' && String(seg.data?.qq) === selfUin
-      );
-      if (!isAtMe) return;
     }
 
     // 群内优先使用群名片，若无群名片则获取备注名/昵称
@@ -1610,7 +2206,7 @@ export const plugin_onmessage = async (ctx, event) => {
       const sizeText = formatFileSize(fileSize);
 
       const fileNotice =
-        `📁 【收到群聊文件】\n` +
+        `📁 【收到群聊文件${isAtMe ? ' (@提醒)' : ''}】\n` +
         `━━━━━━━━━━━━━━━\n` +
         `👥 来自群聊: ${groupName} (${groupId})\n` +
         `👤 发送人: ${senderName} (${senderId})\n` +
@@ -1654,12 +2250,14 @@ export const plugin_onmessage = async (ctx, event) => {
     }
 
     const prefix = currentConfig.show_sender_info
-      ? `[来自群聊: ${groupName}(${groupId}) - ${senderName}(${senderId})]:\n`
+      ? (isAtMe
+          ? `[来自群聊@提醒: ${groupName}(${groupId}) - ${senderName}(${senderId})]:\n`
+          : `[来自群聊: ${groupName}(${groupId}) - ${senderName}(${senderId})]:\n`)
       : '';
 
     let filteredMsg = Array.isArray(event.message)
       ? event.message.filter(seg => !(seg.type === 'at' && String(seg.data?.qq) === selfUin))
-      : (event.raw_message || '');
+      : (event.raw_message || '').replace(new RegExp(`\\[CQ:at,qq=${selfUin}\\]\\s*`, 'g'), '');
 
     let forwardMsg = null;
     if (Array.isArray(filteredMsg)) {
@@ -1684,7 +2282,7 @@ export const plugin_onmessage = async (ctx, event) => {
           original_msg_id: String(event.message_id),
           time: Date.now()
         });
-        logger?.info(`[Relay] 已将群聊 [${groupName}] 内 ${senderName}(${senderId}) 的消息转发至管理员，映射ID: ${res.message_id}`);
+        logger?.info(`[Relay] 已将群聊 [${groupName}] 内 ${senderName}(${senderId}) 的${isAtMe ? ' @提醒' : ''}消息转发至管理员，映射ID: ${res.message_id}`);
       }
     } catch (err) {
       logger?.error(`[Relay] 转发群聊消息至管理员失败:`, err);
@@ -1706,6 +2304,8 @@ export const plugin_get_config = async () => {
  */
 export const plugin_set_config = async (ctx, config) => {
   if (!config) return;
+  const previousScheduleTimes = currentConfig.schedule_times;
+  const previousRandomMinutes = Number(currentConfig.schedule_random_minutes) || 0;
   Object.assign(currentConfig, config);
 
   if (typeof currentConfig.dnd_list_str === 'string') {
@@ -1713,6 +2313,13 @@ export const plugin_set_config = async (ctx, config) => {
   }
 
   saveConfigToFile(ctx?.configPath);
+
+  const scheduleChanged =
+    previousScheduleTimes !== currentConfig.schedule_times ||
+    previousRandomMinutes !== (Number(currentConfig.schedule_random_minutes) || 0);
+  if (scheduleChanged) {
+    generateDailySchedulePlan(new Date(), true);
+  }
 };
 
 /**
@@ -1720,12 +2327,22 @@ export const plugin_set_config = async (ctx, config) => {
  */
 export const plugin_cleanup = async () => {
   if (scheduleTimer) {
-    clearInterval(scheduleTimer);
+    const timer = scheduleTimer;
+    clearInterval(timer);
     scheduleTimer = null;
     logger?.info('[Relay Schedule] 定时调度器已停止');
+    if (globalThis[schedulerStateKey]?.timer === timer) {
+      delete globalThis[schedulerStateKey];
+    }
   }
   if (saveTimer) {
     clearInterval(saveTimer);
     saveTimer = null;
   }
+  for (const [gid, pending] of pendingCardRestores.entries()) {
+    if (pending?.timer) {
+      clearTimeout(pending.timer);
+    }
+  }
+  pendingCardRestores.clear();
 };
