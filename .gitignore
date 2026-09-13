@@ -1,6 +1,7 @@
 # Runtime and user configuration (contains user QQ, tokens, etc.)
 config.json
 message_map.json
+protected_group_cards.json
 data/
 *.log
 
