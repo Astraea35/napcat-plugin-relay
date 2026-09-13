@@ -250,9 +250,44 @@ async function getSelfUin(ctx) {
 }
 
 /**
- * 获取所有受保护的群号列表（去重）
+ * 已加入群列表缓存
  */
-function getProtectedGroupIds() {
+let joinedGroupCache = {
+  time: 0,
+  ids: new Set()
+};
+
+/**
+ * 获取机器人当前实际已加入的群号列表（带5分钟缓存）
+ */
+async function getJoinedGroupIds(ctx, forceRefresh = false) {
+  if (!ctx?.actions?.call) return joinedGroupCache.ids;
+  const now = Date.now();
+  if (!forceRefresh && joinedGroupCache.ids.size > 0 && (now - joinedGroupCache.time < 300000)) {
+    return joinedGroupCache.ids;
+  }
+  try {
+    const list = await ctx.actions.call('get_group_list', { no_cache: forceRefresh }, ctx.adapterName, ctx.pluginManager?.config);
+    if (Array.isArray(list)) {
+      const set = new Set();
+      for (const g of list) {
+        if (g && (g.group_id !== undefined && g.group_id !== null)) {
+          set.add(String(g.group_id).trim());
+        }
+      }
+      joinedGroupCache = { time: now, ids: set };
+      return set;
+    }
+  } catch (err) {
+    logger?.debug?.('[Relay] 获取机器人已加入群列表失败:', err);
+  }
+  return joinedGroupCache.ids;
+}
+
+/**
+ * 获取所有未过滤的受保护群号列表（去重）
+ */
+function getRawProtectedGroupIds() {
   const set = new Set();
   const raw = currentConfig.schedule_groups || '';
   for (const part of raw.split(/[,，\s\n]+/)) {
@@ -267,6 +302,32 @@ function getProtectedGroupIds() {
     }
   }
   return Array.from(set);
+}
+
+/**
+ * 同步获取受保护群号（若有缓存则自动过滤不在的群）
+ */
+function getProtectedGroupIdsSync() {
+  const allIds = getRawProtectedGroupIds();
+  if (joinedGroupCache.ids.size > 0) {
+    return allIds.filter(id => joinedGroupCache.ids.has(id));
+  }
+  return allIds;
+}
+
+/**
+ * 获取所有受保护的群号列表（自动过滤机器人未加入或已退出的群）
+ */
+async function getProtectedGroupIds(ctx) {
+  const allIds = getRawProtectedGroupIds();
+  if (!ctx) return getProtectedGroupIdsSync();
+  try {
+    const joined = await getJoinedGroupIds(ctx);
+    if (joined && joined.size > 0) {
+      return allIds.filter(id => joined.has(id));
+    }
+  } catch (e) {}
+  return allIds;
 }
 
 /**
@@ -325,6 +386,13 @@ async function executeCardRestore(ctx, groupId, isManual = false) {
   }
   pendingCardRestores.delete(gId);
 
+  // 检查机器人是否仍在群中
+  const joined = await getJoinedGroupIds(ctx);
+  if (joined && joined.size > 0 && !joined.has(gId)) {
+    logger?.warn(`[Relay Card] 机器人已不在群 [${gId}]，跳过名片改回`);
+    return { success: false, message: `机器人已不在群 [${gId}]` };
+  }
+
   const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
   if (!expectedCard) return { success: false, message: '未找到期望名片配置' };
 
@@ -376,7 +444,7 @@ async function checkAndScheduleCardRestore(ctx, groupId, currentCard, groupName 
   const gId = String(groupId || '').trim();
   if (!gId) return;
 
-  const protectedIds = getProtectedGroupIds();
+  const protectedIds = await getProtectedGroupIds(ctx);
   if (!protectedIds.includes(gId)) return;
 
   const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
@@ -463,7 +531,7 @@ async function pollCheckProtectedGroupCards(ctx) {
   const selfUin = await getSelfUin(ctx);
   if (!selfUin) return;
 
-  const groupIds = getProtectedGroupIds();
+  const groupIds = await getProtectedGroupIds(ctx);
   for (const gId of groupIds) {
     if (pendingCardRestores.has(gId)) continue;
     try {
@@ -496,8 +564,21 @@ async function initProtectedGroupCards(ctx) {
   const selfUin = await getSelfUin(ctx);
   if (!selfUin) return;
 
-  const groupIds = getProtectedGroupIds();
+  const joined = await getJoinedGroupIds(ctx, true);
   let updated = false;
+
+  // 清理已不在群里的过期名片保护记录
+  if (joined && joined.size > 0) {
+    for (const gid of Array.from(protectedGroupCards.keys())) {
+      if (!joined.has(gid)) {
+        protectedGroupCards.delete(gid);
+        updated = true;
+        logger?.info(`[Relay Card] 检测到机器人已退出群 [${gid}]，已清理该群的名片防篡改记录`);
+      }
+    }
+  }
+
+  const groupIds = await getProtectedGroupIds(ctx);
   for (const gid of groupIds) {
     if (!protectedGroupCards.has(gid)) {
       try {
@@ -978,15 +1059,21 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
   if (targetGroupOverride) {
     groups = [String(targetGroupOverride).trim()];
   } else {
-    groups = (currentConfig.schedule_groups || '')
+    const rawGroups = (currentConfig.schedule_groups || '')
       .split(/[,，\s\n]+/)
       .map(g => g.trim())
       .filter(g => /^\d+$/.test(g));
+    const joined = await getJoinedGroupIds(ctx);
+    if (joined && joined.size > 0) {
+      groups = rawGroups.filter(g => joined.has(g));
+    } else {
+      groups = rawGroups;
+    }
   }
 
   if (groups.length === 0) {
-    logger?.warn(`[Relay Schedule] ${sourceLabel}: 未配置任何有效的目标群号，跳过发送`);
-    return { success: false, message: '未配置任何有效的目标群号，请在插件设置中配置群号或使用指令 #设置群聊 <群号>' };
+    logger?.warn(`[Relay Schedule] ${sourceLabel}: 未配置任何有效且已加入的目标群号，跳过发送`);
+    return { success: false, message: '未配置任何有效且已加入的目标群号，请在插件设置中配置群号或使用指令 #设置群聊 <群号>' };
   }
 
   let imageFile = currentConfig.schedule_custom_image?.trim();
@@ -1247,7 +1334,8 @@ export const plugin_onmessage = async (ctx, event) => {
         })
         .join('\n');
 
-      const protectedCount = getProtectedGroupIds().length;
+      const protectedGroupList = await getProtectedGroupIds(ctx);
+      const protectedCount = protectedGroupList.length;
       const pendingRestoreCount = pendingCardRestores.size;
 
       const statusText =
@@ -1629,7 +1717,7 @@ export const plugin_onmessage = async (ctx, event) => {
 
     // 16. 快捷指令：查看群名片保护状态 (#群名片 / #名片状态 / #查看群名片)
     if (rawText === '#群名片' || rawText === '#名片状态' || rawText === '#查看群名片') {
-      const protectedIds = getProtectedGroupIds();
+      const protectedIds = await getProtectedGroupIds(ctx);
       const delayMinutes = Math.max(1, Number(currentConfig.protect_card_delay_minutes) || 10);
       let descList = [];
       const now = Date.now();
@@ -1692,7 +1780,8 @@ export const plugin_onmessage = async (ctx, event) => {
         }, ctx.adapterName, ctx.pluginManager.config);
       } else {
         currentConfig.default_group_card = cardContent;
-        for (const gid of getProtectedGroupIds()) {
+        const allProtected = await getProtectedGroupIds(ctx);
+        for (const gid of allProtected) {
           protectedGroupCards.set(gid, cardContent);
         }
         saveConfigToFile();
@@ -1720,7 +1809,7 @@ export const plugin_onmessage = async (ctx, event) => {
       } else {
         const pendingKeys = Array.from(pendingCardRestores.keys());
         if (pendingKeys.length === 0) {
-          const allGids = getProtectedGroupIds();
+          const allGids = await getProtectedGroupIds(ctx);
           let count = 0;
           for (const gid of allGids) {
             const res = await executeCardRestore(ctx, gid, true);
