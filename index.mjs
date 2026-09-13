@@ -490,6 +490,9 @@ async function pollCheckProtectedGroupCards(ctx) {
  */
 async function initProtectedGroupCards(ctx) {
   loadProtectedCards();
+  // 等待 8 秒以便 QQ NT 核心完成群列表与成员初始化同步
+  await new Promise(resolve => setTimeout(resolve, 8000));
+
   const selfUin = await getSelfUin(ctx);
   if (!selfUin) return;
 
