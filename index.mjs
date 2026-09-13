@@ -564,21 +564,8 @@ async function initProtectedGroupCards(ctx) {
   const selfUin = await getSelfUin(ctx);
   if (!selfUin) return;
 
-  const joined = await getJoinedGroupIds(ctx, true);
-  let updated = false;
-
-  // 清理已不在群里的过期名片保护记录
-  if (joined && joined.size > 0) {
-    for (const gid of Array.from(protectedGroupCards.keys())) {
-      if (!joined.has(gid)) {
-        protectedGroupCards.delete(gid);
-        updated = true;
-        logger?.info(`[Relay Card] 检测到机器人已退出群 [${gid}]，已清理该群的名片防篡改记录`);
-      }
-    }
-  }
-
   const groupIds = await getProtectedGroupIds(ctx);
+  let updated = false;
   for (const gid of groupIds) {
     if (!protectedGroupCards.has(gid)) {
       try {
