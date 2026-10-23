@@ -24,7 +24,7 @@ export const testing = {
   config: currentConfig, activity: groupActivityMap, plans: dailySchedulePlan, mappings: messageMap,
   pending: pendingFriendRequests, cards: protectedGroupCards, restores: pendingCardRestores,
   generateDailySchedulePlan, sendCatToConfiguredGroups, handleGroupActivityOnMessage,
-  getGroupActivity, isChatDND, callAction, checkAndScheduleCardRestore, executeCardRestore,
+  getGroupActivity, isChatDND, readGroupMasks, callAction, checkAndScheduleCardRestore, executeCardRestore,
   saveGroupActivity, loadGroupActivity, saveMessageMapNow, loadMessageMap, startScheduler,
   resetPlans() { dailySchedulePlan.clear(); currentPlanDate = ''; },
   resetMask() { groupMaskCache = null; groupMaskCacheTime = 0; },
@@ -116,10 +116,13 @@ test('DND handles raw group flags, cached maps, friend notification settings and
   ctx.core.context.session.getGroupService = () => ({ getGroupMsgMask: () => new Map([[group, 1]]) });
   assert.equal(await api.isChatDND(ctx, at), false);
   ctx.core.apis.UserApi = { getUidByUinV2: async () => 'test-uid' };
-  ctx.core.context.session.getBuddyService = () => ({ isBlocked: () => false, getTargetBuddySetting: () => ({ isMsgNotify: false }) });
+  ctx.core.context.session.getBuddyService = () => ({ isBlocked: () => false });
+  ctx.core.context.session.getRecentContactService = () => ({ getContacts: () => ({ foundContacts: [{ chatType: 1, peerUid: 'test-uid', isMsgDisturb: true, isBlock: false }] }) });
   await plugin.plugin_onmessage(ctx, message());
   assert.equal(sent('send_private_msg').length, 0);
-  ctx.core.context.session.getBuddyService = () => ({ isBlocked: () => ({ isBlocked: false }), getTargetBuddySetting: () => ({ isMsgNotify: true }) });
+  ctx.core.context.session.getBuddyService = () => ({ isBlocked: () => ({ isBlocked: false }) });
+  ctx.core.apis.UserApi.getUidByUinV2 = async () => 'unmuted-uid';
+  ctx.core.context.session.getRecentContactService = () => ({ getContacts: () => ({ foundContacts: [{ chatType: 1, peerUid: 'unmuted-uid', isMsgDisturb: false, isBlock: false }] }) });
   assert.equal(await api.isChatDND(ctx, message()), false);
   api.config.dnd_list = [friend];
   assert.equal(await api.isChatDND(ctx, message()), true);
@@ -358,4 +361,33 @@ test('automatic approvals work silently when manual request notifications are di
   await plugin.plugin_onevent(ctx, request('silent-without-notifications'));
   assert.equal(sent('set_friend_add_request').length, 1);
   assert.equal(sent('send_private_msg').length, 0);
+});
+
+test('QQ NT asynchronous group mask result uses msgMask and coalesces concurrent queries', async t => {
+  const { api, ctx } = await fixture(t, { ignore_dnd: true });
+  let queries = 0;
+  ctx.core.eventWrapper = { async callNormalEventV2(service, listener) {
+    assert.equal(service, 'NodeIKernelGroupService/getGroupMsgMask');
+    assert.equal(listener, 'NodeIKernelGroupListener/onGroupsMsgMaskResult');
+    queries++;
+    await Promise.resolve();
+    return [{}, [{ groupCode: group, msgMask: 4 }]];
+  } };
+  const results=await Promise.all(Array.from({ length: 5 }, () => api.isChatDND(ctx, message(friend,'group'))));
+  assert.deepEqual(results, [true,true,true,true,true]);
+  assert.equal(queries, 1);
+});
+
+test('private DND snapshot fallback matches the sender and respects disabling native filtering', async t => {
+  const { api, ctx } = await fixture(t, { ignore_dnd: true });
+  ctx.core.apis.UserApi = {
+    getUidByUinV2: async () => 'correct-uid',
+    getRecentContactListSnapShot: async () => ({ info: { changedList: [
+      { chatType: 1, peerUid: 'someone-else', isMsgDisturb: false },
+      { chatType: 1, peerUid: 'correct-uid', isMsgDisturb: true }
+    ] } })
+  };
+  assert.equal(await api.isChatDND(ctx, message()), true);
+  api.config.ignore_dnd=false;
+  assert.equal(await api.isChatDND(ctx, message()), false);
 });

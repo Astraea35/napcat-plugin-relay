@@ -124,6 +124,8 @@ function configuredGroupIds() {
 // 群消息 Mask 缓存，避免对 QQ NT 核心接口的高频重复轮询
 let groupMaskCache = null;
 let groupMaskCacheTime = 0;
+let groupMaskRefresh = null;
+const contactDndCache = new Map();
 const GROUP_MASK_CACHE_TTL = 15000; // 15秒缓存
 
 // 好友备注与昵称缓存: uin -> { nickname, remark, lastUpdated }
@@ -911,31 +913,78 @@ async function handleFriendRequestEvent(ctx, event) {
  * @param {object} event 接收到的消息事件
  * @returns {Promise<boolean>} 若免打扰则返回 true
  */
+async function readGroupMasks(ctx) {
+  if (groupMaskCache && Date.now() - groupMaskCacheTime < GROUP_MASK_CACHE_TTL) return groupMaskCache;
+  if (!groupMaskRefresh) {
+    groupMaskRefresh = (async () => {
+      let masks;
+      if (typeof ctx.core?.eventWrapper?.callNormalEventV2 === 'function') {
+        // QQ returns only an ACK from getGroupMsgMask; actual masks arrive on this listener.
+        const [, result] = await ctx.core.eventWrapper.callNormalEventV2(
+          'NodeIKernelGroupService/getGroupMsgMask', 'NodeIKernelGroupListener/onGroupsMsgMaskResult',
+          [], r => r.result === 0, () => true, 1, 3000
+        );
+        masks = result;
+      } else {
+        masks = await ctx.core?.context?.session?.getGroupService?.()?.getGroupMsgMask?.();
+      }
+      groupMaskCache = masks?.groupMaskMap ?? masks?.groupCodeMap ?? masks?.data ?? masks;
+      groupMaskCacheTime = Date.now();
+      return groupMaskCache;
+    })().finally(() => { groupMaskRefresh = null; });
+  }
+  return groupMaskRefresh;
+}
+
+async function readContactDND(ctx, chatType, peerUid, peerUin) {
+  const key = `${chatType}:${peerUid}`;
+  const cached = contactDndCache.get(key);
+  if (cached && Date.now() - cached.time < GROUP_MASK_CACHE_TTL) return cached.contact;
+  const service = ctx.core?.context?.session?.getRecentContactService?.();
+  let contacts;
+  if (typeof service?.getContacts === 'function') {
+    const result = await service.getContacts([{ chatType, peerUid, guildId: '' }]);
+    contacts = result?.foundContacts;
+  }
+  let contact = contacts?.find(c => Number(c.chatType) === chatType &&
+    (String(c.peerUid) === peerUid || String(c.peerUin) === peerUin));
+  if (!contact && typeof ctx.core?.apis?.UserApi?.getRecentContactListSnapShot === 'function') {
+    const snapshot = await ctx.core.apis.UserApi.getRecentContactListSnapShot(100);
+    contact = snapshot?.info?.changedList?.find(c => Number(c.chatType) === chatType &&
+      (String(c.peerUid) === peerUid || String(c.peerUin) === peerUin));
+  }
+  // Keep only DND flags, never cache message bodies from native recent contacts.
+  const flags = contact ? { isMsgDisturb: contact.isMsgDisturb, isBlock: contact.isBlock } : null;
+  if (flags) {
+    contactDndCache.set(key, { time: Date.now(), contact: flags });
+    if (contactDndCache.size > 5000) contactDndCache.delete(contactDndCache.keys().next().value);
+  }
+  return flags;
+}
+
 async function isChatDND(ctx, event) {
   const senderId = String(event.user_id || '');
   const groupId = String(event.group_id || '');
   const manual = (currentConfig.dnd_list || []).map(String);
   if (manual.includes(senderId) || (groupId && manual.includes(groupId))) return true;
   if (!currentConfig.ignore_dnd) return false;
-  const mutedMask = value => [2, 3, 4].includes(Number(value?.groupMask ?? value?.mask ?? value));
+  const mutedMask = value => [2, 3, 4].includes(Number(value?.msgMask ?? value?.groupMask ?? value?.mask ?? value));
   const raw = event.raw || {};
+  if (raw.isMsgDisturb === true || raw.isBlock === true) return true;
   if (event.message_type === 'group' && groupId) {
     if (mutedMask(raw.groupMask) || raw.elements?.some(el => mutedMask(el?.extraInfo?.groupMask))) return true;
     try {
-      const service = ctx.core?.context?.session?.getGroupService?.();
-      if (typeof service?.getGroupMsgMask === 'function') {
-        if (!groupMaskCache || Date.now() - groupMaskCacheTime > GROUP_MASK_CACHE_TTL) {
-          groupMaskCache = await service.getGroupMsgMask();
-          groupMaskCacheTime = Date.now();
-        }
-        const masks = groupMaskCache?.groupMaskMap ?? groupMaskCache?.groupCodeMap ?? groupMaskCache?.data ?? groupMaskCache;
-        let value;
-        if (masks instanceof Map) value = masks.get(groupId) ?? masks.get(Number(groupId)) ?? masks.get(BigInt(groupId));
-        else if (Array.isArray(masks)) value = masks.find(m => String(m.groupCode ?? m.code ?? m.id) === groupId);
-        else value = masks?.[groupId];
-        if (mutedMask(value)) return true;
-      }
+      const masks = await readGroupMasks(ctx);
+      let value;
+      if (masks instanceof Map) value = masks.get(groupId) ?? masks.get(Number(groupId)) ?? masks.get(BigInt(groupId));
+      else if (Array.isArray(masks)) value = masks.find(m => String(m.groupCode ?? m.code ?? m.id) === groupId);
+      else value = masks?.[groupId];
+      if (mutedMask(value)) return true;
     } catch (err) { logger?.debug('[Relay] 读取群免打扰状态失败:', err); }
+    try {
+      const contact = await readContactDND(ctx, 2, groupId, groupId);
+      if (contact?.isMsgDisturb === true || contact?.isBlock === true) return true;
+    } catch (err) { logger?.debug('[Relay] 读取群会话状态失败:', err); }
   }
   if (event.message_type === 'private' && senderId) {
     try {
@@ -945,12 +994,10 @@ async function isChatDND(ctx, event) {
       if (uid && buddy) {
         const blocked = typeof buddy.isBlocked === 'function' ? await buddy.isBlocked(uid) : false;
         if (blocked === true || blocked === 1 || blocked?.isBlocked === true) return true;
-        if (typeof buddy.getTargetBuddySetting === 'function') {
-          const setting = await buddy.getTargetBuddySetting(uid);
-          if (setting?.isMsgNotify === false || setting?.isMsgNotify === 0 ||
-              setting?.isMsgNotify === '0' || setting?.isMsgNotify === 'false' ||
-              setting?.msgNotify === false || setting?.msgNotify === 0) return true;
-        }
+      }
+      if (uid) {
+        const contact = await readContactDND(ctx, 1, String(uid), senderId);
+        if (contact?.isMsgDisturb === true || contact?.isBlock === true) return true;
       }
       if (raw.isMsgNotify === false || raw.isMsgNotify === 0) return true;
     } catch (err) { logger?.debug('[Relay] 读取私聊免打扰状态失败:', err); }
