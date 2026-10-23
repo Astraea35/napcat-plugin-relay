@@ -24,7 +24,7 @@ export const testing = {
   config: currentConfig, activity: groupActivityMap, plans: dailySchedulePlan, mappings: messageMap,
   pending: pendingFriendRequests, cards: protectedGroupCards, restores: pendingCardRestores,
   generateDailySchedulePlan, sendCatToConfiguredGroups, handleGroupActivityOnMessage,
-  getGroupActivity, isChatDND, readGroupMasks, callAction, checkAndScheduleCardRestore, executeCardRestore,
+  getGroupActivity, refreshActivityFromHistory, activityHistoryCheckDue, isChatDND, readGroupMasks, callAction, checkAndScheduleCardRestore, executeCardRestore,
   saveGroupActivity, loadGroupActivity, saveMessageMapNow, loadMessageMap, startScheduler,
   resetPlans() { dailySchedulePlan.clear(); currentPlanDate = ''; },
   resetMask() { groupMaskCache = null; groupMaskCacheTime = 0; },
@@ -44,6 +44,7 @@ export const testing = {
       if (handlers[action]) return await handlers[action](params);
       if (action === 'get_group_list') return [{ group_id: group }];
       if (action === 'get_friend_list') return [];
+      if (action === 'get_group_msg_history') return { messages: [] };
       if (action === 'get_login_info') return { user_id: self };
       if (action === 'get_stranger_info') return { nickname: 'Test user' };
       if (action === 'get_group_member_info') return { card: 'Expected' };
@@ -390,4 +391,67 @@ test('private DND snapshot fallback matches the sender and respects disabling na
   assert.equal(await api.isChatDND(ctx, message()), true);
   api.config.ignore_dnd=false;
   assert.equal(await api.isChatDND(ctx, message()), false);
+});
+
+function historyMessage(id, user=friend, seconds=5) {
+  return { message_id: id, message_seq: id, user_id: user, group_id: group,
+    time: Math.floor(Date.now()/1000)-seconds };
+}
+
+test('missed offline history restores eligibility without sending twice today', async t => {
+  const { api, ctx, sent, handlers } = await fixture(t, { schedule_min_other_msgs: 15 });
+  Object.assign(api.getGroupActivity(group), { lastSentDate: '2026-10-21', lastSentTime: Date.now()-2*86400000, otherMsgCount: 7 });
+  handlers.get_group_msg_history=()=>({ messages: Array.from({length:34},(_,i)=>historyMessage(30000+i)) });
+  await api.sendCatToConfiguredGroups(ctx);
+  assert.equal(sent('send_group_msg').length,1);
+  await api.sendCatToConfiguredGroups(ctx);
+  assert.equal(sent('send_group_msg').length,1);
+  assert.equal(sent('get_group_msg_history').length,1);
+});
+
+test('history and live counts overlap; own, old and duplicate history messages do not count', async t => {
+  const { api, ctx, sent, handlers } = await fixture(t, { schedule_min_other_msgs: 15 });
+  Object.assign(api.getGroupActivity(group), { lastSentTime: Date.now()-100000, otherMsgCount: 9 });
+  const recent=Array.from({length:12},(_,i)=>historyMessage(31000+i));
+  handlers.get_group_msg_history=()=>({messages:[...recent,...recent,historyMessage(32000,self),historyMessage(32001,friend,200)]});
+  await api.sendCatToConfiguredGroups(ctx);
+  assert.equal(api.getGroupActivity(group).otherMsgCount,12);
+  assert.equal(sent('send_group_msg').length,0);
+  await api.handleGroupActivityOnMessage(ctx,message(friend,'group',[text('Delayed delivery')],31000));
+  assert.equal(api.getGroupActivity(group).otherMsgCount,12);
+});
+
+test('history paginates with the oldest message id and deduplicates overlapping pages', async t => {
+  const { api, ctx, handlers, sent } = await fixture(t, { schedule_min_other_msgs: 15 });
+  api.getGroupActivity(group).lastSentTime=Date.now()-100000;
+  const first=Array.from({length:10},(_,i)=>historyMessage(33000+i,friend,10-i));
+  handlers.get_group_msg_history=params=>{
+    if(!params.message_seq) return {messages:first};
+    assert.equal(params.message_seq,'33000');
+    return {messages:[first[0],...Array.from({length:8},(_,i)=>historyMessage(34000+i,friend,30-i))]};
+  };
+  await api.refreshActivityFromHistory(ctx,group);
+  assert.equal(api.getGroupActivity(group).otherMsgCount,18);
+  assert.equal(sent('get_group_msg_history').length,2);
+});
+
+test('failed history requests retain counts and are throttled rather than blocking all future checks', async t => {
+  const { api, ctx, handlers, sent } = await fixture(t);
+  Object.assign(api.getGroupActivity(group),{lastSentTime:Date.now()-100000,otherMsgCount:3});
+  handlers.get_group_msg_history=()=>{throw new Error('History unavailable');};
+  await api.refreshActivityFromHistory(ctx,group);
+  await api.refreshActivityFromHistory(ctx,group);
+  assert.equal(sent('get_group_msg_history').length,1);
+  assert.equal(api.getGroupActivity(group).otherMsgCount,3);
+  t.mock.timers.setTime(Date.now()+61000);
+  assert.equal(api.activityHistoryCheckDue(group),true);
+});
+
+test('waiting groups periodically recover offline history even without new live messages', async t => {
+  const { api, ctx, handlers, sent } = await fixture(t, { schedule_min_other_msgs: 15 });
+  Object.assign(api.getGroupActivity(group),{lastSentDate:'2026-10-21',lastSentTime:Date.now()-2*86400000,otherMsgCount:7,waitingForActivity:true});
+  handlers.get_group_msg_history=()=>({messages:Array.from({length:25},(_,i)=>historyMessage(35000+i))});
+  api.startScheduler(ctx);
+  t.mock.timers.tick(15000); await settle();
+  assert.equal(sent('send_group_msg').length,1);
 });

@@ -1,7 +1,7 @@
 {
   "name": "napcat-plugin-relay",
   "plugin": "消息中转传话",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "type": "module",
   "main": "index.mjs",
   "description": "NapCat 私聊与群聊@中转、引用回复、免打扰过滤、静默自动加好友或引用审批、北京时间定时消息与跨天防刷屏、群名片保护",

@@ -94,6 +94,8 @@ const friendNotificationsInFlight = new Set();
 const friendApprovalsInFlight = new Set();
 const groupSendsInFlight = new Set();
 const activityMessageIds = new Map();
+const activityHistoryChecks = new Map();
+const ACTIVITY_HISTORY_TTL = 60000;
 let pluginActive = true;
 const shanghaiClock = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -1089,6 +1091,65 @@ function saveGroupActivityDebounced() {
   }, 5000);
 }
 
+function activityHistoryCheckDue(groupId) {
+  const previous = activityHistoryChecks.get(String(groupId));
+  return !previous || previous.since !== getGroupActivity(groupId).lastSentTime ||
+    previous.threshold !== activityThreshold() || Date.now() - previous.time >= ACTIVITY_HISTORY_TTL;
+}
+
+async function refreshActivityFromHistory(ctx, groupId) {
+  const gid = String(groupId);
+  const activity = getGroupActivity(gid);
+  const since = activity.lastSentTime;
+  if (!since || activity.otherMsgCount > activityThreshold() || !activityHistoryCheckDue(gid)) return;
+  activityHistoryChecks.set(gid, { time: Date.now(), since, threshold: activityThreshold() });
+  try {
+    const self = await getSelfUin(ctx);
+    if (!self) return;
+    const seen = new Set();
+    let cursor;
+    let count = 0;
+    // shortcut: read up to 20 pages per check; raise this cap if large thresholds need deeper history.
+    for (let page = 0; page < 20 && count <= activityThreshold(); page++) {
+      const data = await callAction(ctx, 'get_group_msg_history', {
+        group_id: Number(gid), count: 100, reverse_order: false,
+        disable_get_url: true, parse_mult_msg: false,
+        ...(cursor ? { message_seq: cursor } : {})
+      });
+      const messages = Array.isArray(data) ? data : data?.messages;
+      if (!Array.isArray(messages)) throw new Error('群历史记录返回格式异常');
+      if (!messages.length) break;
+      const valid = messages.filter(m => Number.isFinite(Number(m.time)) && Number(m.time) > 0)
+        .sort((a, b) => Number(a.time) - Number(b.time) || Number(a.message_seq || 0) - Number(b.message_seq || 0));
+      for (const message of valid) {
+        const id = message.message_id;
+        const sender = message.user_id ?? message.sender?.user_id;
+        if (id === undefined || sender === undefined || seen.has(String(id))) continue;
+        seen.add(String(id));
+        if (message.group_id !== undefined && String(message.group_id) !== gid) continue;
+        // Historical timestamps have second precision; exclude ambiguous messages in the send's own second.
+        if (Number(message.time) * 1000 <= since || String(sender) === self) continue;
+        count++;
+        activityMessageIds.set(`${gid}:${id}`, true);
+        if (activityMessageIds.size > 10000) activityMessageIds.delete(activityMessageIds.keys().next().value);
+      }
+      const oldest = valid[0];
+      if (!oldest || Number(oldest.time) * 1000 <= since) break;
+      // NapCat resolves this parameter through its short message-id table, despite its sequence name.
+      const nextCursor = oldest.message_id === undefined ? '' : String(oldest.message_id);
+      if (!nextCursor || nextCursor === cursor) break;
+      cursor = nextCursor;
+    }
+    if (!pluginActive || activity.lastSentTime !== since) return;
+    // History overlaps the live counter: never add the two counts together.
+    if (count > activity.otherMsgCount) {
+      activity.otherMsgCount = count;
+      saveGroupActivity();
+      logger?.info(`[Relay Schedule] 群 [${gid}] 已用历史记录修正其他成员发言计数: ${count}`);
+    }
+  } catch (err) { logger?.warn(`[Relay Schedule] 群 [${gid}] 历史活跃度复核失败，保留现有计数:`, err); }
+}
+
 // ========================================================
 // 定时群发月薪喵表情包核心调度模块
 // ========================================================
@@ -1217,6 +1278,10 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
       if (!pluginActive || localClock().hour < 8 || activity.lastSentDate === date || activity.lastAttemptDate === date) {
         skippedCount++; continue;
       }
+      if (currentConfig.enable_schedule_activity_check) await refreshActivityFromHistory(ctx, gid);
+      if (!pluginActive || localClock().hour < 8 || getTodayDateStr() !== date) {
+        skippedCount++; continue;
+      }
       if (currentConfig.enable_schedule_activity_check && activity.lastSentTime > 0
           && activity.otherMsgCount <= activityThreshold()) {
         activity.waitingForActivity = true;
@@ -1313,7 +1378,9 @@ function startScheduler(ctx) {
       if ([...dailySchedulePlan.values()].some(p => Date.now() >= p.targetTimestamp)) {
         for (const gid of configuredGroupIds()) {
           const activity = getGroupActivity(gid);
-          if (activity.waitingForActivity && activity.otherMsgCount > activityThreshold()) {
+          if (activity.waitingForActivity && activity.lastSentDate !== getTodayDateStr() &&
+              activity.lastAttemptDate !== getTodayDateStr() &&
+              (activity.otherMsgCount > activityThreshold() || activityHistoryCheckDue(gid))) {
             await sendCatToConfiguredGroups(ctx, '等待活跃后补发', gid);
           }
         }
