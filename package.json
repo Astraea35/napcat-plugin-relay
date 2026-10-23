@@ -1,10 +1,14 @@
 {
   "name": "napcat-plugin-relay",
   "plugin": "消息中转传话",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "type": "module",
   "main": "index.mjs",
-  "description": "NapCat 消息双向中转与引用回复插件，支持备注名优先展示、群聊@实时提醒、群名片防篡改自动恢复(延迟10分钟)、引用回复原消息、私聊/群聊文件双向转发、免打扰智能过滤、好友申请拦截与一键审批、定时群发月薪喵表情包及防死群刷屏智能活跃度检测",
+  "description": "NapCat 私聊与群聊@中转、引用回复、免打扰过滤、静默自动加好友或引用审批、北京时间定时消息与跨天防刷屏、群名片保护",
+  "scripts": {
+    "test": "node --test relay.test.mjs",
+    "check": "node --check index.mjs"
+  },
   "author": "Astraea35",
   "license": "MIT",
   "repository": {

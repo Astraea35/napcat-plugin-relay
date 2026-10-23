@@ -2,6 +2,10 @@
 config.json
 message_map.json
 protected_group_cards.json
+group_schedule_activity.json
+daily_schedule_plan.json
+*.json.tmp
+*.zip
 data/
 *.log
 
