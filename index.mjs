@@ -85,7 +85,8 @@ const protectedGroupCards = new Map();
 
 // 待执行的名片改回任务: groupId -> { timer, expectedCard, oldCard, newCard, detectedAt, scheduledAt, groupName }
 const pendingCardRestores = new Map();
-let cardPollCounter = 0;
+const CARD_POLL_INTERVAL_MS = 10 * 60 * 1000;
+let lastCardPollAt = Date.now();
 
 // 待处理的好友申请缓存: key -> { user_id, nickname, flag, comment, time }
 // 这里的 key 可以是 message_id (发给管理员的消息ID)、user_id (申请人QQ)、flag
@@ -95,8 +96,40 @@ const friendApprovalsInFlight = new Set();
 const groupSendsInFlight = new Set();
 const activityMessageIds = new Map();
 const activityHistoryChecks = new Map();
-const ACTIVITY_HISTORY_TTL = 60000;
+const ACTIVITY_HISTORY_TTL = 5 * 60 * 1000;
 let pluginActive = true;
+const BACKGROUND_OPERATION_GAP_MS = 10000;
+let backgroundOperationGapMs = BACKGROUND_OPERATION_GAP_MS;
+const backgroundGateKey = Symbol.for('napcat-plugin-relay.background-operations');
+let backgroundGate = globalThis[backgroundGateKey] ||= { tail: Promise.resolve(), lastFinished: null };
+const backgroundWaits = new Map();
+
+function backgroundCancelled() {
+  return Object.assign(new Error('后台操作已取消'), { code: 'RELAY_BACKGROUND_CANCELLED' });
+}
+
+function runBackgroundOperation(operation, guard = () => true) {
+  const state = backgroundGate;
+  const task = state.tail.then(async () => {
+    if (!pluginActive || !guard()) throw backgroundCancelled();
+    const delay = state.lastFinished === null ? 0 : Math.max(0, state.lastFinished + backgroundOperationGapMs - Date.now());
+    if (delay > 0) {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { backgroundWaits.delete(timer); resolve(); }, delay);
+        backgroundWaits.set(timer, reject);
+      });
+    }
+    if (!pluginActive || !guard()) throw backgroundCancelled();
+    try { return await operation(); }
+    finally { state.lastFinished = Date.now(); }
+  });
+  state.tail = task.catch(() => {});
+  return task;
+}
+
+function callBackgroundAction(ctx, action, params = {}, guard) {
+  return runBackgroundOperation(() => callAction(ctx, action, params), guard);
+}
 const shanghaiClock = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
@@ -163,13 +196,13 @@ async function callAction(ctx, actionName, params = {}) {
 /**
  * 刷新好友列表缓存（获取所有好友的最新备注与原始昵称）
  */
-async function refreshFriendCache(ctx, force = false) {
+async function refreshFriendCache(ctx, force = false, background = false) {
   const now = Date.now();
   if (!force && friendCache.size > 0 && now - lastFriendRefresh < FRIEND_CACHE_TTL) {
     return;
   }
   try {
-    const rawRes = await callAction(ctx, 'get_friend_list', {});
+    const rawRes = await (background ? callBackgroundAction : callAction)(ctx, 'get_friend_list', {});
     const res = Array.isArray(rawRes) ? rawRes : (Array.isArray(rawRes?.data) ? rawRes.data : []);
     if (Array.isArray(res)) {
       for (const item of res) {
@@ -327,10 +360,10 @@ function recordMessageMapping(sentId, info) {
 /**
  * 获取机器人自身的 QQ 号
  */
-async function getSelfUin(ctx) {
+async function getSelfUin(ctx, background = false) {
   if (ctx.core?.selfInfo?.uin) return String(ctx.core.selfInfo.uin).trim();
   try {
-    const loginInfo = await callAction(ctx, 'get_login_info', {});
+    const loginInfo = await (background ? callBackgroundAction : callAction)(ctx, 'get_login_info', {});
     if (loginInfo?.user_id) return String(loginInfo.user_id).trim();
   } catch (e) {}
   return '';
@@ -347,14 +380,14 @@ let joinedGroupCache = {
 /**
  * 获取机器人当前实际已加入的群号列表（带5分钟缓存）
  */
-async function getJoinedGroupIds(ctx, forceRefresh = false) {
+async function getJoinedGroupIds(ctx, forceRefresh = false, background = false) {
   if (!ctx?.actions) return joinedGroupCache.ids;
   const now = Date.now();
   if (!forceRefresh && joinedGroupCache.time > 0 && (now - joinedGroupCache.time < 300000)) {
     return joinedGroupCache.ids;
   }
   try {
-    const rawList = await callAction(ctx, 'get_group_list', { no_cache: forceRefresh });
+    const rawList = await (background ? callBackgroundAction : callAction)(ctx, 'get_group_list', { no_cache: forceRefresh });
     const list = Array.isArray(rawList) ? rawList : (Array.isArray(rawList?.data) ? rawList.data : []);
     if (Array.isArray(rawList) || Array.isArray(rawList?.data)) {
       const set = new Set();
@@ -363,7 +396,7 @@ async function getJoinedGroupIds(ctx, forceRefresh = false) {
           set.add(String(g.group_id).trim());
         }
       }
-      joinedGroupCache = { time: now, ids: set };
+      joinedGroupCache = { time: Date.now(), ids: set };
       return set;
     }
   } catch (err) {
@@ -406,11 +439,11 @@ function getProtectedGroupIdsSync() {
 /**
  * 获取所有受保护的群号列表（自动过滤机器人未加入或已退出的群）
  */
-async function getProtectedGroupIds(ctx) {
+async function getProtectedGroupIds(ctx, background = false) {
   const allIds = getRawProtectedGroupIds();
   if (!ctx) return getProtectedGroupIdsSync();
   try {
-    const joined = await getJoinedGroupIds(ctx);
+    const joined = await getJoinedGroupIds(ctx, false, background);
     if (joinedGroupCache.time > 0) {
       return allIds.filter(id => joined.has(id));
     }
@@ -476,7 +509,8 @@ async function executeCardRestore(ctx, groupId, isManual = false) {
   pendingCardRestores.delete(gId);
 
   // 实时强制刷新群列表，检查机器人是否仍在群中
-  const joined = await getJoinedGroupIds(ctx, true);
+  const joined = await getJoinedGroupIds(ctx, true, !isManual);
+  if (!isManual && (!pluginActive || !currentConfig.auto_protect_group_card)) return { success: false, message: '群名片保护已关闭' };
   if (joinedGroupCache.time > 0 && !joined.has(gId)) {
     logger?.warn(`[Relay Card] 机器人已不在群 [${gId}]，跳过名片改回并自动移除保护`);
     if (protectedGroupCards.has(gId)) {
@@ -499,15 +533,16 @@ async function executeCardRestore(ctx, groupId, isManual = false) {
   if (!expectedCard) return { success: false, message: '未找到期望名片配置' };
 
   const targetQq = String(currentConfig.target_qq || '').trim();
-  const selfUin = await getSelfUin(ctx);
+  const selfUin = await getSelfUin(ctx, !isManual);
   if (!selfUin) return { success: false, message: '无法获取机器人自身QQ号' };
 
   try {
-    await callAction(ctx, 'set_group_card', {
+    await (isManual ? callAction : callBackgroundAction)(ctx, 'set_group_card', {
       group_id: Number(gId),
       user_id: Number(selfUin),
       card: expectedCard
-    });
+    }, () => currentConfig.auto_protect_group_card &&
+      (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim() === expectedCard);
 
     logger?.info(`[Relay Card] ✅ 成功将群 [${gId}] 的群名片改回: "${expectedCard}" (${isManual ? '手动执行' : '自动恢复'})`);
 
@@ -525,6 +560,7 @@ async function executeCardRestore(ctx, groupId, isManual = false) {
     }
     return { success: true, message: '成功' };
   } catch (err) {
+    if (err?.code === 'RELAY_BACKGROUND_CANCELLED') return { success: false, message: '后台名片恢复已取消' };
     const errMsg = err?.message || String(err);
     // 若提示成员不存在或未加入群，从受保护列表中移除
     if (errMsg.includes('不存在') || errMsg.includes('未加入') || errMsg.includes('不在群')) {
@@ -638,18 +674,19 @@ async function checkAndScheduleCardRestore(ctx, groupId, currentCard, groupName 
  */
 async function pollCheckProtectedGroupCards(ctx) {
   if (!currentConfig.auto_protect_group_card) return;
-  const selfUin = await getSelfUin(ctx);
+  const selfUin = await getSelfUin(ctx, true);
   if (!selfUin) return;
 
-  const groupIds = await getProtectedGroupIds(ctx);
+  const groupIds = await getProtectedGroupIds(ctx, true);
   for (const gId of groupIds) {
+    if (!pluginActive || !currentConfig.auto_protect_group_card) break;
     if (pendingCardRestores.has(gId)) continue;
     try {
-      const info = await callAction(ctx, 'get_group_member_info', {
+      const info = await callBackgroundAction(ctx, 'get_group_member_info', {
         group_id: Number(gId),
         user_id: Number(selfUin),
         no_cache: true
-      });
+      }, () => currentConfig.auto_protect_group_card);
       if (info && (info.card !== undefined || info.nickname !== undefined)) {
         const currentCard = (info.card || '').trim();
         const expectedCard = (protectedGroupCards.get(gId) || currentConfig.default_group_card || '').trim();
@@ -678,21 +715,22 @@ async function initProtectedGroupCards(ctx) {
   loadProtectedCards();
   // 等待 8 秒以便 QQ NT 核心完成群列表与成员初始化同步
   await new Promise(resolve => setTimeout(resolve, 8000));
-  if (!pluginActive) return;
+  if (!pluginActive || !currentConfig.auto_protect_group_card) return;
 
-  const selfUin = await getSelfUin(ctx);
+  const selfUin = await getSelfUin(ctx, true);
   if (!selfUin) return;
 
-  const groupIds = await getProtectedGroupIds(ctx);
+  const groupIds = await getProtectedGroupIds(ctx, true);
   let updated = false;
   for (const gid of groupIds) {
+    if (!pluginActive || !currentConfig.auto_protect_group_card) break;
     if (!protectedGroupCards.has(gid)) {
       try {
-        const info = await callAction(ctx, 'get_group_member_info', {
+        const info = await callBackgroundAction(ctx, 'get_group_member_info', {
           group_id: Number(gid),
           user_id: Number(selfUin),
           no_cache: true
-        });
+        }, () => currentConfig.auto_protect_group_card);
         const card = (info?.card || '').trim();
         if (card) {
           protectedGroupCards.set(gid, card);
@@ -1093,6 +1131,7 @@ function saveGroupActivityDebounced() {
 
 function activityHistoryCheckDue(groupId) {
   const previous = activityHistoryChecks.get(String(groupId));
+  if (previous?.running) return false;
   return !previous || previous.since !== getGroupActivity(groupId).lastSentTime ||
     previous.threshold !== activityThreshold() || Date.now() - previous.time >= ACTIVITY_HISTORY_TTL;
 }
@@ -1102,20 +1141,21 @@ async function refreshActivityFromHistory(ctx, groupId) {
   const activity = getGroupActivity(gid);
   const since = activity.lastSentTime;
   if (!since || activity.otherMsgCount > activityThreshold() || !activityHistoryCheckDue(gid)) return;
-  activityHistoryChecks.set(gid, { time: Date.now(), since, threshold: activityThreshold() });
+  const check = { time: Date.now(), since, threshold: activityThreshold(), running: true };
+  activityHistoryChecks.set(gid, check);
   try {
-    const self = await getSelfUin(ctx);
+    const self = await getSelfUin(ctx, true);
     if (!self) return;
     const seen = new Set();
     let cursor;
     let count = 0;
     // shortcut: read up to 20 pages per check; raise this cap if large thresholds need deeper history.
     for (let page = 0; page < 20 && count <= activityThreshold(); page++) {
-      const data = await callAction(ctx, 'get_group_msg_history', {
+      const data = await callBackgroundAction(ctx, 'get_group_msg_history', {
         group_id: Number(gid), count: 100, reverse_order: false,
         disable_get_url: true, parse_mult_msg: false,
         ...(cursor ? { message_seq: cursor } : {})
-      });
+      }, () => currentConfig.enable_schedule && currentConfig.enable_schedule_activity_check && activity.lastSentTime === since);
       const messages = Array.isArray(data) ? data : data?.messages;
       if (!Array.isArray(messages)) throw new Error('群历史记录返回格式异常');
       if (!messages.length) break;
@@ -1148,6 +1188,7 @@ async function refreshActivityFromHistory(ctx, groupId) {
       logger?.info(`[Relay Schedule] 群 [${gid}] 已用历史记录修正其他成员发言计数: ${count}`);
     }
   } catch (err) { logger?.warn(`[Relay Schedule] 群 [${gid}] 历史活跃度复核失败，保留现有计数:`, err); }
+  finally { check.running = false; check.time = Date.now(); }
 }
 
 // ========================================================
@@ -1255,7 +1296,7 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
   }
   let groups = targetGroupOverride ? [String(targetGroupOverride).trim()] : configuredGroupIds();
   groups = [...new Set(groups.filter(g => /^\d+$/.test(g)))];
-  const joined = await getJoinedGroupIds(ctx);
+  const joined = await getJoinedGroupIds(ctx, false, true);
   if (joinedGroupCache.time > 0) groups = groups.filter(g => joined.has(g));
   if (!groups.length) return { success: false, message: '未配置有效且已加入的目标群号' };
 
@@ -1289,21 +1330,38 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
         saveGroupActivity();
         continue;
       }
-      // Persist a reservation before any network send. A crash/timeout must never cause a second send today.
-      activity.lastAttemptDate = date;
-      if (!saveGroupActivity()) { activity.lastAttemptDate = ''; failCount++; continue; }
-      const countAtSend = activity.otherMsgCount;
-      const sentAt = Date.now();
-      const result = await callAction(ctx, 'send_group_msg', { group_id: Number(gid), message });
-      if (result?.message_id === undefined) throw new Error('发送结果缺少 message_id，保留当日发送占位以防重发');
-      activity.lastSentDate = date;
-      activity.lastSentTime = sentAt;
-      activity.otherMsgCount = Math.max(0, activity.otherMsgCount - countAtSend);
-      activity.waitingForActivity = false;
-      saveGroupActivity();
-      successCount++;
-      logger?.info(`[Relay Schedule] ${sourceLabel}: 群 [${gid}] 今日发送完成`);
+      const outcome = await runBackgroundOperation(async () => {
+        // Recheck after waiting: never send a stale queued task after midnight, disabling, or another send.
+        if (localClock().hour < 8 || getTodayDateStr() !== date || activity.lastSentDate === date ||
+            activity.lastAttemptDate === date || (!targetGroupOverride && !configuredGroupIds().includes(gid)) ||
+            (!currentConfig.enable_schedule && sourceLabel !== '管理员手动指令')) return 'skipped';
+        if (currentConfig.enable_schedule_activity_check && activity.lastSentTime > 0 &&
+            activity.otherMsgCount <= activityThreshold()) {
+          activity.waitingForActivity = true;
+          saveGroupActivity();
+          return 'deferred';
+        }
+        // Reserve immediately before dispatch, not while merely waiting in the rate-limit queue.
+        activity.lastAttemptDate = date;
+        if (!saveGroupActivity()) { activity.lastAttemptDate = ''; return 'failed'; }
+        const countAtSend = activity.otherMsgCount;
+        const sentAt = Date.now();
+        const result = await callAction(ctx, 'send_group_msg', { group_id: Number(gid), message });
+        if (result?.message_id === undefined) throw new Error('发送结果缺少 message_id，保留当日发送占位以防重发');
+        activity.lastSentDate = date;
+        activity.lastSentTime = sentAt;
+        activity.otherMsgCount = Math.max(0, activity.otherMsgCount - countAtSend);
+        activity.waitingForActivity = false;
+        saveGroupActivity();
+        logger?.info(`[Relay Schedule] ${sourceLabel}: 群 [${gid}] 今日发送完成`);
+        return 'sent';
+      });
+      if (outcome === 'sent') successCount++;
+      else if (outcome === 'deferred') deferredCount++;
+      else if (outcome === 'failed') failCount++;
+      else skippedCount++;
     } catch (err) {
+      if (err?.code === 'RELAY_BACKGROUND_CANCELLED') { skippedCount++; continue; }
       failCount++;
       logger?.error(`[Relay Schedule] 群 [${gid}] 发送失败或结果不确定，当日不自动重试:`, err);
     } finally {
@@ -1321,7 +1379,7 @@ async function sendCatToConfiguredGroups(ctx, sourceLabel = '定时任务', targ
  * 监听群消息活跃度：累加非机器人消息并在达到防刷门槛时自动触发今日定时补发
  */
 async function handleGroupActivityOnMessage(ctx, event) {
-  if (event.message_type !== 'group' || String(event.user_id) === await getSelfUin(ctx)) return;
+  if (!pluginActive || event.message_type !== 'group' || String(event.user_id) === await getSelfUin(ctx)) return;
   const gid = String(event.group_id || '');
   if (!configuredGroupIds().includes(gid)) return;
   if (event.message_id !== undefined) {
@@ -1356,8 +1414,10 @@ function startScheduler(ctx) {
     state.busy = true;
     try {
       // Card protection is independent of whether scheduled group messages are enabled.
-      cardPollCounter++;
-      if (cardPollCounter % 8 === 0) await pollCheckProtectedGroupCards(ctx);
+      if (Date.now() - lastCardPollAt >= CARD_POLL_INTERVAL_MS) {
+        lastCardPollAt = Date.now();
+        await pollCheckProtectedGroupCards(ctx);
+      }
       if (!currentConfig.enable_schedule || localClock().hour < 8) return;
       generateDailySchedulePlan();
       for (const plan of dailySchedulePlan.values()) {
@@ -1396,6 +1456,7 @@ function startScheduler(ctx) {
  */
 export const plugin_init = async (ctx) => {
   pluginActive = true;
+  lastCardPollAt = Date.now();
   logger = ctx.logger;
   logger.info("消息中转与好友申请处理插件正在初始化...");
 
@@ -1425,7 +1486,7 @@ export const plugin_init = async (ctx) => {
   startScheduler(ctx);
 
   // 4. 预加载好友列表与备注缓存
-  refreshFriendCache(ctx).catch(err => logger?.debug?.('[Relay] 预加载好友缓存失败:', err));
+  refreshFriendCache(ctx, false, true).catch(err => logger?.debug?.('[Relay] 预加载好友缓存失败:', err));
 
   // 5. 初始化群名片防篡改保护基线与任务
   initProtectedGroupCards(ctx).catch(err => logger?.error?.('[Relay Card] 初始化群名片保护异常:', err));
@@ -1511,7 +1572,7 @@ export const plugin_onevent = async (ctx, event) => {
  * 消息事件监听
  */
 export const plugin_onmessage = async (ctx, event) => {
-  if (!event || event.post_type !== 'message') return;
+  if (!pluginActive || !event || event.post_type !== 'message') return;
 
   const senderId = String(event.user_id || '').trim();
   const targetQq = String(currentConfig.target_qq || '').trim();
@@ -2577,7 +2638,7 @@ export const plugin_onmessage = async (ctx, event) => {
   if (event.message_type === 'group') {
     // 0. 群活跃度统计与防刷屏自动补发检测（排除机器人自身消息）
     if (senderId !== selfUin) {
-      await handleGroupActivityOnMessage(ctx, event);
+      handleGroupActivityOnMessage(ctx, event).catch(err => logger?.debug?.('[Relay] 群活跃度后台处理结束:', err));
     }
 
     // 检查是否有人 @ 机器人
@@ -2750,6 +2811,11 @@ export const plugin_set_config = async (ctx, config) => {
  */
 export const plugin_cleanup = async () => {
   pluginActive = false;
+  for (const [timer, reject] of backgroundWaits) {
+    clearTimeout(timer);
+    reject(backgroundCancelled());
+  }
+  backgroundWaits.clear();
   if (scheduleTimer) {
     const timer = scheduleTimer;
     clearInterval(timer);

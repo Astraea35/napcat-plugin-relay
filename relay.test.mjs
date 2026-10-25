@@ -20,12 +20,17 @@ async function fixture(t, config = {}, time = noon) {
   fs.writeFileSync(file, source + `
 export const testing = {
   setup(dir, config) { dataDir = dir; pluginConfigPath = path.join(dir, 'config.json');
-    logger = { info(){}, debug(){}, warn(){}, error(){} }; Object.assign(currentConfig, config); },
+    logger = { info(){}, debug(){}, warn(){}, error(){} }; Object.assign(currentConfig, config);
+    backgroundOperationGapMs = 0; backgroundGate = { tail: Promise.resolve(), lastFinished: null };
+    globalThis[backgroundGateKey] = backgroundGate; },
   config: currentConfig, activity: groupActivityMap, plans: dailySchedulePlan, mappings: messageMap,
   pending: pendingFriendRequests, cards: protectedGroupCards, restores: pendingCardRestores,
   generateDailySchedulePlan, sendCatToConfiguredGroups, handleGroupActivityOnMessage,
   getGroupActivity, refreshActivityFromHistory, activityHistoryCheckDue, isChatDND, readGroupMasks, callAction, checkAndScheduleCardRestore, executeCardRestore,
   saveGroupActivity, loadGroupActivity, saveMessageMapNow, loadMessageMap, startScheduler,
+  runBackgroundOperation, callBackgroundAction, getJoinedGroupIds,
+  setBackgroundGap(ms) { backgroundOperationGapMs = ms; },
+  timing: { cardPollMs: CARD_POLL_INTERVAL_MS, historyCheckMs: ACTIVITY_HISTORY_TTL, backgroundGapMs: BACKGROUND_OPERATION_GAP_MS },
   resetPlans() { dailySchedulePlan.clear(); currentPlanDate = ''; },
   resetMask() { groupMaskCache = null; groupMaskCacheTime = 0; },
 };`);
@@ -292,6 +297,8 @@ test('card safety polling runs even when scheduled messaging is disabled', async
   const { api, ctx, sent } = await fixture(t, { enable_schedule: false, default_group_card: 'Expected' });
   api.startScheduler(ctx);
   for (let i = 0; i < 8; i++) { t.mock.timers.tick(15000); await settle(); }
+  assert.equal(sent('get_group_member_info').length, 0);
+  for (let i = 0; i < 32; i++) { t.mock.timers.tick(15000); await settle(); }
   assert.equal(sent('get_group_member_info').length, 1);
   assert.equal(sent('send_group_msg').length, 0);
 });
@@ -443,8 +450,150 @@ test('failed history requests retain counts and are throttled rather than blocki
   await api.refreshActivityFromHistory(ctx,group);
   assert.equal(sent('get_group_msg_history').length,1);
   assert.equal(api.getGroupActivity(group).otherMsgCount,3);
-  t.mock.timers.setTime(Date.now()+61000);
+  t.mock.timers.setTime(Date.now()+299999);
+  assert.equal(api.activityHistoryCheckDue(group),false);
+  t.mock.timers.setTime(Date.now()+2);
   assert.equal(api.activityHistoryCheckDue(group),true);
+});
+
+test('background operations share a ten-second gap; foreground replies stay immediate', async t => {
+  const { api, ctx, sent } = await fixture(t);
+  api.setBackgroundGap(10000);
+  const started = [];
+  const first = api.runBackgroundOperation(async () => { started.push(Date.now()); });
+  const second = api.runBackgroundOperation(async () => { started.push(Date.now()); });
+  const third = api.runBackgroundOperation(async () => { started.push(Date.now()); });
+  await settle();
+  assert.equal(started.length, 1);
+  await api.callAction(ctx, 'send_private_msg', { user_id: admin, message: 'Immediate reply' });
+  assert.equal(sent('send_private_msg').length, 1);
+  t.mock.timers.tick(9999); await settle();
+  assert.equal(started.length, 1);
+  t.mock.timers.tick(1); await settle();
+  assert.equal(started.length, 2);
+  t.mock.timers.tick(10000); await settle();
+  await Promise.all([first, second, third]);
+  assert.deepEqual(started.map(t => t-started[0]), [0, 10000, 20000]);
+});
+
+test('the ten-second gap starts when the previous operation finishes', async t => {
+  const { api } = await fixture(t);
+  api.setBackgroundGap(10000);
+  let finish;
+  const started=[];
+  const first=api.runBackgroundOperation(()=>new Promise(resolve=>{ finish=resolve; started.push(Date.now()); }));
+  const second=api.runBackgroundOperation(async()=>{ started.push(Date.now()); });
+  await settle();
+  t.mock.timers.tick(8000); finish(); await settle();
+  t.mock.timers.tick(9999); await settle();
+  assert.equal(started.length,1);
+  t.mock.timers.tick(1); await settle();
+  await Promise.all([first,second]);
+  assert.equal(started[1]-started[0],18000);
+});
+
+test('a failed background operation also enforces the gap before the next operation', async t => {
+  const { api } = await fixture(t);
+  api.setBackgroundGap(10000);
+  const first=api.runBackgroundOperation(async()=>{ throw new Error('API failed'); });
+  const failed=assert.rejects(first,/API failed/);
+  let calls=0;
+  const next=api.runBackgroundOperation(async()=>{ calls++; });
+  await failed; await settle();
+  assert.equal(calls,0);
+  t.mock.timers.tick(10000); await settle();
+  await next;
+  assert.equal(calls,1);
+});
+
+test('unloading cancels queued background operations without sending or reserving the day', async t => {
+  const { plugin, api, ctx, sent } = await fixture(t);
+  await api.getJoinedGroupIds(ctx);
+  api.setBackgroundGap(10000);
+  await api.runBackgroundOperation(async()=>{});
+  const sending=api.sendCatToConfiguredGroups(ctx);
+  await settle();
+  assert.equal(api.getGroupActivity(group).lastAttemptDate,'');
+  await plugin.plugin_cleanup();
+  const result=await sending;
+  assert.equal(result.skippedCount,1);
+  assert.equal(sent('send_group_msg').length,0);
+  assert.equal(api.getGroupActivity(group).lastAttemptDate,'');
+});
+
+test('queued group sends recheck the date and 08:00 floor after waiting', async t => {
+  const { api, ctx, sent } = await fixture(t, {}, '2026-10-23T15:59:55Z');
+  await api.getJoinedGroupIds(ctx);
+  api.setBackgroundGap(10000);
+  await api.runBackgroundOperation(async()=>{});
+  const sending=api.sendCatToConfiguredGroups(ctx);
+  await settle();
+  t.mock.timers.tick(10000); await settle();
+  const result=await sending;
+  assert.equal(result.skippedCount,1);
+  assert.equal(sent('send_group_msg').length,0);
+  assert.equal(api.getGroupActivity(group).lastAttemptDate,'');
+});
+
+test('production intervals are ten minutes, five minutes, and ten seconds', async t => {
+  const { api } = await fixture(t);
+  assert.deepEqual(api.timing,{cardPollMs:600000,historyCheckMs:300000,backgroundGapMs:10000});
+});
+
+test('history throttle starts after a slow queued check completes and suppresses overlapping checks', async t => {
+  const { api, ctx, handlers } = await fixture(t);
+  api.getGroupActivity(group).lastSentTime=Date.now()-100000;
+  let finish;
+  handlers.get_group_msg_history=()=>new Promise(resolve=>{finish=resolve;});
+  const checking=api.refreshActivityFromHistory(ctx,group);
+  await settle();
+  t.mock.timers.setTime(Date.now()+600000);
+  assert.equal(api.activityHistoryCheckDue(group),false);
+  finish({messages:[]}); await checking;
+  t.mock.timers.setTime(Date.now()+299999);
+  assert.equal(api.activityHistoryCheckDue(group),false);
+  t.mock.timers.setTime(Date.now()+1);
+  assert.equal(api.activityHistoryCheckDue(group),true);
+});
+
+test('a queued automatic operation rechecks its enabled flag before dispatch', async t => {
+  const { api, ctx, sent } = await fixture(t);
+  api.setBackgroundGap(10000);
+  await api.runBackgroundOperation(async()=>{});
+  let enabled=true;
+  const pending=api.callBackgroundAction(ctx,'set_group_card',{group_id:group,user_id:self,card:'Expected'},()=>enabled);
+  const cancelled=assert.rejects(pending,error=>error.code==='RELAY_BACKGROUND_CANCELLED');
+  await settle();
+  enabled=false;
+  t.mock.timers.tick(10000); await cancelled;
+  assert.equal(sent('set_group_card').length,0);
+});
+
+test('a group @ notification stays immediate while its activity-triggered reminder waits in the background', async t => {
+  const { plugin, api, ctx, sent } = await fixture(t, { schedule_min_other_msgs:0 });
+  await api.getJoinedGroupIds(ctx);
+  api.setBackgroundGap(10000);
+  await api.runBackgroundOperation(async()=>{});
+  api.generateDailySchedulePlan();
+  Object.assign(api.getGroupActivity(group),{lastSentDate:'2026-10-22',lastSentTime:Date.now()-86400000,waitingForActivity:true});
+  await plugin.plugin_onmessage(ctx,message(friend,'group',[{type:'at',data:{qq:self}},text('Please reply')],39000));
+  assert.equal(sent('send_private_msg').length,1);
+  assert.equal(sent('send_group_msg').length,0);
+  t.mock.timers.tick(10000); await settle();
+  assert.equal(sent('send_group_msg').length,1);
+});
+
+test('queued automatic card restores cannot overwrite a newly changed expected card', async t => {
+  const { api, ctx, sent } = await fixture(t, { default_group_card:'Expected' });
+  api.setBackgroundGap(10000);
+  const restoring=api.executeCardRestore(ctx,group);
+  await settle();
+  assert.equal(sent('get_group_list').length,1);
+  api.config.default_group_card='New expected card';
+  t.mock.timers.tick(10000); await settle();
+  const result=await restoring;
+  assert.equal(result.success,false);
+  assert.equal(sent('set_group_card').length,0);
 });
 
 test('waiting groups periodically recover offline history even without new live messages', async t => {
